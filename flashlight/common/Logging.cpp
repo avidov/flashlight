@@ -255,31 +255,63 @@ LogLevel logLevelValue(const std::string& level) {
 }
 
 void initFlLogging(char* argv[]) {
-  const std::string logLevel = "--fl_log_level=";
-  const std::string vlogLevel = "--fl_vlog_level=";
+  const std::string logLevel = "--fl_log_level";
+  const std::string vlogLevel = "--fl_vlog_level";
+  const std::string logLevelAssign = logLevel + '=';
+  const std::string vlogLevelAssign = vlogLevel + '=';
 
   while (*argv) {
     std::string arg(*argv);
-    if (arg.find(logLevel) == 0) {
-      const std::string flagValue = arg.substr(logLevel.size());
+    if (arg == logLevel) {
+      ++argv;
+      if (argv) {
+        const std::string flagValue(*argv);
+        try {
+          LogLevel level = logLevelValue(flagValue);
+          Logging::setMaxLoggingLevel(level);
+        } catch (std::exception& ex) {
+          std::cerr << "invalid " << logLevelAssign << " value=" << flagValue
+                    << " error={" << ex.what() << "}" << std::endl;
+        }
+      } else {
+        std::cerr << "missing " << logLevelAssign << " value" << std::endl;
+        return;
+      }
+    } else if (arg == vlogLevel) {
+      ++argv;
+      if (argv) {
+        const std::string flagValue(*argv);
+        int vlogLevelAssign = 0;
+        try {
+          vlogLevelAssign = std::stoi(flagValue);
+        } catch (std::exception& ex) {
+          std::cerr << "invalid " << vlogLevelAssign << " value=" << flagValue
+                    << " error={" << ex.what() << "}" << std::endl;
+        }
+        VerboseLogging::setMaxLoggingLevel(vlogLevelAssign);
+      } else {
+        std::cerr << "missing " << vlogLevelAssign << " value" << std::endl;
+        return;
+      }
+    } else if (arg.find(logLevelAssign) == 0) {
+      const std::string flagValue = arg.substr(logLevelAssign.size());
       try {
         LogLevel level = logLevelValue(flagValue);
         Logging::setMaxLoggingLevel(level);
       } catch (std::exception& ex) {
-        std::cerr << "invalid " << logLevel << " value=" << flagValue
+        std::cerr << "invalid " << logLevelAssign << " value=" << flagValue
                   << " error={" << ex.what() << "}" << std::endl;
       }
-    }
-    if (arg.find(vlogLevel) == 0) {
-      const std::string flagValue = arg.substr(vlogLevel.size());
-      int vlogLevel = 0;
+    } else if (arg.find(vlogLevelAssign) == 0) {
+      const std::string flagValue = arg.substr(vlogLevelAssign.size());
+      int vlogLevelAssign = 0;
       try {
-        vlogLevel = std::stoi(flagValue);
+        vlogLevelAssign = std::stoi(flagValue);
       } catch (std::exception& ex) {
-        std::cerr << "invalid " << vlogLevel << " value=" << flagValue
+        std::cerr << "invalid " << vlogLevelAssign << " value=" << flagValue
                   << " error={" << ex.what() << "}" << std::endl;
       }
-      VerboseLogging::setMaxLoggingLevel(vlogLevel);
+      VerboseLogging::setMaxLoggingLevel(vlogLevelAssign);
     }
     ++argv;
   }

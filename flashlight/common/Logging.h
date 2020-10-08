@@ -85,6 +85,8 @@ namespace fl {
  * Call first thing in main() to enable command line logging flags:
  * `--fl_log_level=XXX`
  * `--fl_vlog_level=N`
+ * Both the assignment sign and space are valid between the flag and its value.
+ * These are equivalent:  `--fl_log_level=INFO` and `--fl_log_level INFO`
  *
  * Add this function on first line in main() as follows:
  * \code
