@@ -30,7 +30,7 @@ class ReverbEcho : public SoundEffect {
  public:
   struct Config {
     /**
-     * probability of aapplying reverb.
+     * probability of applying reverb.
      */
     float proba_ = 1.0;
     /**
