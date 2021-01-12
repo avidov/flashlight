@@ -15,6 +15,7 @@
 #include <set>
 #include <unordered_map>
 #include <vector>
+#include <stack>
 
 #include "flashlight/fl/memory/MemoryManagerAdapter.h"
 #include "flashlight/fl/memory/MemoryManagerDeviceInterface.h"
@@ -111,6 +112,9 @@ class CachingMemoryManager : public MemoryManagerAdapter {
 
     // cached blocks 1 MB or smaller
     BlockSet smallBlocks_;
+
+    std::stack<Block*> tinyBlocks_;
+    bool tinyBlocksInit_ = false;
 
     // allocated blocks by device pointer
     std::unordered_map<void*, Block*> allocatedBlocks_;

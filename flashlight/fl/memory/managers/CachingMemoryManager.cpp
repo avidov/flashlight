@@ -22,6 +22,9 @@ namespace fl {
 
 namespace {
 
+constexpr size_t kTinyBlockSize = 256;
+constexpr size_t kTinyBlockCount = 10000;
+
 constexpr size_t kMinBlockSize =
     512; // all sizes are rounded to at least 512 bytes
 constexpr size_t kSmallSize = 1048576; // largest "small" allocation is 1 MiB
@@ -130,13 +133,23 @@ void* CachingMemoryManager::alloc(
   if (size == 0) {
     return nullptr;
   }
+
+  CachingMemoryManager::Block* block = nullptr;
+  if (size <= kTinyBlockSize && !memoryInfo.tinyBlocks_.empty()) {
+    block = memoryInfo.tinyBlocks_.top();
+    memoryInfo.tinyBlocks_.pop();
+    block->managerLock_ = !userLock;
+    block->userLock_ = userLock;
+    memoryInfo.allocatedBlocks_[block->ptr_] = block;
+    return static_cast<void*>(block->ptr_);
+  }
+
   size = roundSize(size);
   const bool isSmallAlloc = (size <= kSmallSize);
   CachingMemoryManager::Block searchKey(size);
   CachingMemoryManager::BlockSet& pool =
       isSmallAlloc ? memoryInfo.smallBlocks_ : memoryInfo.largeBlocks_;
 
-  CachingMemoryManager::Block* block = nullptr;
   auto it = pool.lower_bound(&searchKey);
   // Recycle blocks if any found, and if small alloc or the block size is not
   // too large:
@@ -232,6 +245,11 @@ void CachingMemoryManager::freeBlock(CachingMemoryManager::Block* block) {
   }
   auto& memoryInfo = getDeviceMemoryInfo();
   std::lock_guard<std::recursive_mutex> lock(memoryInfo.mutexAll_);
+
+  if (block->size_ == kTinyBlockSize) {
+    memoryInfo.tinyBlocks_.push(block);
+    return;
+  }
 
   const bool isSmallAlloc = (block->size_ <= kSmallSize);
   CachingMemoryManager::BlockSet& pool =
@@ -335,6 +353,11 @@ void CachingMemoryManager::signalMemoryCleanup() {
       memoryInfo.smallBlocks_,
       memoryInfo.smallBlocks_.begin(),
       memoryInfo.smallBlocks_.end());
+
+  // freeBlocks(
+  //     memoryInfo.tinyBlocks_,
+  //     memoryInfo.tinyBlocks_.begin(),
+  //     memoryInfo.tinyBlocks_.end());
 }
 
 float CachingMemoryManager::getMemoryPressure() {
@@ -406,6 +429,16 @@ CachingMemoryManager::getDeviceMemoryInfo(int device /* = -1*/) {
   if (it == deviceMemInfos_.end() || !it->second) {
     throw std::runtime_error("meminfo for the device doesn't exist");
   }
+  if (!it->second->tinyBlocksInit_) {
+    it->second->tinyBlocksInit_ = true;
+    void* ptr =
+        this->deviceInterface->nativeAlloc(kTinyBlockSize * kTinyBlockCount);
+    for (int i = 0; i < kTinyBlockCount; ++i) {
+      void* curPtr = static_cast<char*>(ptr) + kTinyBlockSize * i;
+      it->second->tinyBlocks_.push(new Block(kTinyBlockSize, curPtr));
+    }
+  }
+
   return *(it->second);
 }
 } // namespace fl
