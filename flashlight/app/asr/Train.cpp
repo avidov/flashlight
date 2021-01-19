@@ -24,7 +24,6 @@
 #include "flashlight/app/asr/data/FeatureTransforms.h"
 #include "flashlight/app/asr/data/Utils.h"
 #include "flashlight/app/asr/decoder/DecodeMaster.h"
-#include "flashlight/app/asr/decoder/PlGenerator.h"
 #include "flashlight/app/asr/decoder/TranscriptionUtils.h"
 #include "flashlight/app/asr/runtime/runtime.h"
 #include "flashlight/ext/common/DistributedUtils.h"
@@ -70,27 +69,8 @@ DEFINE_string(
     unsup_train,
     "",
     "comma-separated list of unsupervised training data");
-DEFINE_string(
-    ipl_relabel_epoch,
-    "10000000",
-    "comma-separated list of epoch to regenerate PL");
-DEFINE_string(
-    ipl_relabel_ratio,
-    "1",
-    "comma-separated list of number of files to regenerate PL");
-DEFINE_bool(ipl_use_existing_pl, false, "use existing pl from the list file");
-DEFINE_double(ipl_seed_model_wer, -1, "WER of seed model");
-DEFINE_double(ipl_minisz, 0, "minimum duration of audio");
-DEFINE_double(
-    ipl_maxisz,
-    std::numeric_limits<double>::max(),
-    "maximum duration of audio");
-DEFINE_int64(ipl_mintsz, 0, "minimum length of targets in words");
-DEFINE_int64(
-    ipl_maxtsz,
-    std::numeric_limits<int64_t>::max(),
-    "maximum length of targets in words");
-
+DEFINE_int64(slimIPL_start, 0, "updates to start slimIPL");
+DEFINE_string(slimIPL_type, "naive", "naive - relabel then bwd;");
 } // namespace
 
 int main(int argc, char** argv) {
@@ -306,9 +286,39 @@ int main(int argc, char** argv) {
   auto padVal = std::make_tuple(0, targetpadVal, wordpadVal);
 
   std::vector<std::string> trainSplits = fl::lib::split(",", FLAGS_train, true);
+  std::vector<std::string> unsupTrainSplits =
+      fl::lib::split(",", FLAGS_unsup_train, true);
   auto trainds = createDataset(
       trainSplits,
       FLAGS_datadir,
+      FLAGS_batchsize,
+      inputTransform,
+      targetTransform,
+      wordTransform,
+      padVal,
+      worldRank,
+      worldSize,
+      false, // allowEmpty
+      FLAGS_batching_strategy,
+      FLAGS_batching_max_duration);
+
+  auto traindsNoUnsup = createDataset(
+      trainSplits,
+      FLAGS_datadir,
+      FLAGS_batchsize * 2,
+      inputTransform,
+      targetTransform,
+      wordTransform,
+      padVal,
+      worldRank,
+      worldSize,
+      false, // allowEmpty
+      FLAGS_batching_strategy,
+      FLAGS_batching_max_duration);
+
+  auto unsupTrainds = createDataset(
+      unsupTrainSplits,
+      FLAGS_unsup_datadir,
       FLAGS_batchsize,
       inputTransform,
       targetTransform,
@@ -345,22 +355,13 @@ int main(int argc, char** argv) {
   std::shared_ptr<fl::FirstOrderOptimizer> critoptim;
   std::shared_ptr<fl::lib::text::LM> lm;
   std::shared_ptr<WordDecodeMaster> dm;
-  bool usePlugin = false;
 
   auto scalemode = getCriterionScaleMode(FLAGS_onorm, FLAGS_sqnorm);
-  if (fl::lib::endsWith(FLAGS_arch, ".so")) {
-    usePlugin = true;
-    (void)fl::ext::ModulePlugin(FLAGS_arch);
-  }
+  (void)fl::ext::ModulePlugin(FLAGS_arch);
   if (runStatus == kTrainMode) {
     FL_LOG_MASTER(INFO) << "Loading architecture file from " << FLAGS_arch;
     // Encoder network, works on audio
-    if (fl::lib::endsWith(FLAGS_arch, ".so")) {
-      network = fl::ext::ModulePlugin(FLAGS_arch).arch(numFeatures, numClasses);
-    } else {
-      network =
-          fl::ext::buildSequentialModule(FLAGS_arch, numFeatures, numClasses);
-    }
+    network = fl::ext::ModulePlugin(FLAGS_arch).arch(numFeatures, numClasses);
     if (FLAGS_criterion == kCtcCriterion) {
       criterion = std::make_shared<CTCLoss>(scalemode);
     } else if (FLAGS_criterion == kAsgCriterion) {
@@ -439,7 +440,7 @@ int main(int argc, char** argv) {
           network,
           lm,
           dummyTransition,
-          usePlugin,
+          true, // usePlugin
           tokenDict,
           wordDict,
           DecodeMasterTrainOptions{.repLabel = int32_t(FLAGS_replabel),
@@ -531,16 +532,14 @@ int main(int argc, char** argv) {
   }
 
   /* ===================== PL Generator ===================== */
-  TokenToWordFunc tokenToWord =
-      [&isSeq2seqCrit](
-          const std::vector<int>& tokens,
-          const fl::lib::text::Dictionary& dict,
-          bool isPrediction) -> std::vector<std::string> {
+  auto tokenToWord = [&isSeq2seqCrit, &tokenDict](
+                         const std::vector<int>& tokens,
+                         bool isPrediction) -> std::vector<std::string> {
     std::vector<std::string> letters;
     if (isPrediction) {
       letters = tknPrediction2Ltr(
           tokens,
-          dict,
+          tokenDict,
           FLAGS_criterion,
           FLAGS_surround,
           isSeq2seqCrit,
@@ -550,7 +549,7 @@ int main(int argc, char** argv) {
     } else {
       letters = tknTarget2Ltr(
           tokens,
-          dict,
+          tokenDict,
           FLAGS_criterion,
           FLAGS_surround,
           isSeq2seqCrit,
@@ -561,34 +560,9 @@ int main(int argc, char** argv) {
     return tkn2Wrd(letters, FLAGS_wordseparator);
   };
 
-  // PlGenerator will always be created. However, if no ipl-related flags are
-  // specified, the dummy PlGenerator created from the default values will be
-  // completely invisible in training.
-  auto plGenerator = PlGenerator(
-      tokenDict,
-      runPath,
-      worldRank,
-      worldSize,
-      FLAGS_batchsize,
-      FLAGS_unsup_datadir,
-      FLAGS_unsup_train,
-      FLAGS_ipl_relabel_epoch,
-      FLAGS_ipl_relabel_ratio,
-      FLAGS_ipl_use_existing_pl,
-      FLAGS_ipl_seed_model_wer,
-      FLAGS_ipl_minisz,
-      FLAGS_ipl_maxisz,
-      FLAGS_ipl_mintsz,
-      FLAGS_ipl_maxtsz,
-      padVal,
-      inputTransform,
-      targetTransform,
-      wordTransform,
-      tokenToWord);
-
   /* ===================== Hooks ===================== */
   auto logStatus =
-      [&logFile, &validTagSets, &plGenerator, isMaster](
+      [&logFile, &validTagSets, isMaster](
           TrainMeters& mtrs,
           std::unordered_map<std::string, double>& validWerWithDecoder,
           int64_t epoch,
@@ -596,8 +570,6 @@ int main(int argc, char** argv) {
           double lr,
           double lrcrit) {
         syncMeter(mtrs);
-        plGenerator.setModelWER(
-            mtrs.valid[validTagSets.front().first].wrdEdit.errorRate()[0]);
 
         if (isMaster) {
           auto logMsg = getLogString(
@@ -745,7 +717,7 @@ int main(int argc, char** argv) {
     }
   };
 
-  auto test = [&evalOutput, &dm, &lexicon, &usePlugin, &isSeq2seqCrit](
+  auto test = [&evalOutput, &dm, &lexicon, &isSeq2seqCrit](
                   std::shared_ptr<fl::Module> ntwrk,
                   std::shared_ptr<SequenceCriterion> crit,
                   std::shared_ptr<fl::Dataset> validds,
@@ -828,16 +800,10 @@ int main(int argc, char** argv) {
     }
 
     for (auto& batch : *curValidset) {
-      fl::Variable output;
-      if (usePlugin) {
-        output = ntwrk
-                     ->forward({fl::input(batch[kInputIdx]),
-                                fl::noGrad(batch[kDurationIdx])})
-                     .front();
-      } else {
-        output = fl::ext::forwardSequentialModuleWithPadMask(
-            fl::input(batch[kInputIdx]), ntwrk, batch[kDurationIdx]);
-      }
+      fl::Variable output = ntwrk
+                                ->forward({fl::input(batch[kInputIdx]),
+                                           fl::noGrad(batch[kDurationIdx])})
+                                .front();
       std::vector<fl::Variable> critArgs = {
           output, fl::Variable(batch[kTargetIdx], false)};
       if (isSeq2seqCrit) {
@@ -851,23 +817,6 @@ int main(int argc, char** argv) {
   };
 
   int64_t curEpoch = startEpoch;
-  // Try reloading existing PL
-  auto unsupDataDir = plGenerator.reloadPl(curEpoch);
-  // If loading failes, try regenerate PL
-  if (unsupDataDir.empty()) {
-    unsupDataDir =
-        plGenerator.regeneratePl(curEpoch, network, criterion, usePlugin);
-  }
-  // If any PLs loaded, update train set
-  if (!unsupDataDir.empty()) {
-    trainds = plGenerator.createTrainSet(
-        FLAGS_datadir,
-        FLAGS_train,
-        unsupDataDir,
-        FLAGS_batching_strategy,
-        FLAGS_batching_max_duration);
-  }
-
   auto train = [&meters,
                 &validWerWithDecoder,
                 &test,
@@ -877,27 +826,33 @@ int main(int argc, char** argv) {
                 &validds,
                 &curEpoch,
                 &startUpdate,
-                &plGenerator,
-                &usePlugin,
                 &isSeq2seqCrit,
+                &targetTransform,
+                &tokenToWord,
+                &targetpadVal,
                 reducer](
                    std::shared_ptr<fl::Module> ntwrk,
                    std::shared_ptr<SequenceCriterion> crit,
                    std::shared_ptr<fl::Dataset> trainset,
+                   std::shared_ptr<fl::Dataset> unsupTrainset,
                    std::shared_ptr<fl::FirstOrderOptimizer> netopt,
                    std::shared_ptr<fl::FirstOrderOptimizer> critopt,
                    double initlr,
                    double initcritlr,
                    bool clampCrit,
                    int64_t nbatches) {
+    fl::EditDistanceMeter unsupQuality;
     if (reducer) {
       fl::distributeModuleGrads(ntwrk, reducer);
       fl::distributeModuleGrads(crit, reducer);
     }
 
     meters.train.loss.reset();
+    meters.trainUnsup.loss.reset();
     meters.train.tknEdit.reset();
     meters.train.wrdEdit.reset();
+    meters.trainUnsup.tknEdit.reset();
+    meters.trainUnsup.wrdEdit.reset();
 
     std::shared_ptr<fl::Module> saug;
     if (FLAGS_saug_start_update >= 0) {
@@ -975,6 +930,9 @@ int main(int argc, char** argv) {
       meters.train.loss.reset();
       meters.train.tknEdit.reset();
       meters.train.wrdEdit.reset();
+      meters.trainUnsup.loss.reset();
+      meters.trainUnsup.tknEdit.reset();
+      meters.trainUnsup.wrdEdit.reset();
     };
 
     int64_t curBatch = startUpdate;
@@ -998,15 +956,32 @@ int main(int argc, char** argv) {
       }
       std::hash<std::string> hasher;
       FL_LOG_MASTER(INFO) << "Shuffling trainset";
+      bool useUnsup = !(unsupTrainset == nullptr);
+      FL_LOG_MASTER(INFO) << "Unsup is in use " << useUnsup;
       auto curTrainset = loadPrefetchDataset(
           trainset, FLAGS_nthread, true /* shuffle */, curEpoch /* seed */);
+      std::shared_ptr<fl::Dataset> curUnsupTrainset;
+      if (useUnsup) {
+        curUnsupTrainset = loadPrefetchDataset(
+            unsupTrainset,
+            FLAGS_nthread,
+            true /* shuffle */,
+            curEpoch /* seed */);
+      }
       af::sync();
       meters.sampletimer.resume();
       meters.runtime.resume();
       meters.timer.resume();
       FL_LOG_MASTER(INFO) << "Epoch " << curEpoch << " started!";
+      int unsupBatchIdx = -1;
       for (auto& batch : *curTrainset) {
+        ++unsupBatchIdx;
         ++curBatch;
+        std::vector<af::array> batchUnsup;
+        if (useUnsup) {
+          batchUnsup =
+              curUnsupTrainset->get(unsupBatchIdx % curUnsupTrainset->size());
+        }
         double lrScheduleScale;
         if (FLAGS_lrcosine) {
           const double pi = std::acos(-1);
@@ -1045,27 +1020,103 @@ int main(int argc, char** argv) {
           // forward
           meters.fwdtimer.resume();
           auto input = fl::input(batch[kInputIdx]);
+          fl::Variable inputUnsup, inputUnsupOriginal, outputUnsup,
+              outputUnsupOriginal;
+          std::vector<fl::Variable> critArgsUnsup;
+          if (useUnsup) {
+            inputUnsupOriginal = fl::input(batchUnsup[kInputIdx]);
+          }
           if (FLAGS_saug_start_update >= 0 &&
               curBatch >= FLAGS_saug_start_update) {
             input = saug->forward({input}).front();
+            if (useUnsup) {
+              inputUnsup = saug->forward({inputUnsupOriginal}).front();
+            }
           }
-          fl::Variable output;
-          if (usePlugin) {
-            output = ntwrk->forward({input, fl::noGrad(batch[kDurationIdx])})
-                         .front();
-          } else {
-            output = fl::ext::forwardSequentialModuleWithPadMask(
-                input, ntwrk, batch[kDurationIdx]);
-          }
-          af::sync();
-          meters.critfwdtimer.resume();
+          auto output =
+              ntwrk->forward({input, fl::noGrad(batch[kDurationIdx])}).front();
           std::vector<fl::Variable> critArgs = {
               output, fl::Variable(batch[kTargetIdx], false)};
           if (isSeq2seqCrit) {
             critArgs.push_back(fl::Variable(batch[kDurationIdx], false));
             critArgs.push_back(fl::Variable(batch[kTargetSizeIdx], false));
           }
-          auto loss = crit->forward(critArgs).front();
+          af::array newTargetsBatch, newTargetsSizeBatch;
+          if (useUnsup) {
+            outputUnsup = ntwrk
+                              ->forward({inputUnsup,
+                                         fl::noGrad(batchUnsup[kDurationIdx])})
+                              .front();
+            ntwrk->eval();
+            crit->eval();
+            outputUnsupOriginal =
+                ntwrk
+                    ->forward({inputUnsupOriginal,
+                               fl::noGrad(batchUnsup[kDurationIdx])})
+                    .front();
+            auto viterbiPath = crit->viterbiPath(
+                outputUnsupOriginal.array(), batchUnsup[kDurationIdx]);
+
+            ntwrk->train();
+            crit->train();
+
+            unsupQuality.reset();
+
+            std::vector<af::array> newTargets, newTargetsSize;
+            if (curBatch % 100 == 0) {
+              FL_LOG_MASTER(INFO)
+                  << "PL for samples "
+                  << join(",", readSampleIds(batchUnsup[kSampleIdx]));
+            }
+            for (int index = 0; index < viterbiPath.dims(1); index++) {
+              auto tokenPrediction = afToVector<int>(viterbiPath.col(index));
+              auto plArray = tokenToWord(tokenPrediction, true);
+              auto plTrueArray = tokenToWord(afToVector<int>(batchUnsup[kTargetIdx].col(index)), false);
+              auto plText = fl::lib::join(" ", plArray);
+              if (curBatch % 100 == 0) {
+                FL_LOG_MASTER(INFO)
+                    << "PL for index " << index << ": " << plText;
+              }
+              unsupQuality.add(plArray, plTrueArray);
+              std::vector<char> curTarget(plText.begin(), plText.end());
+              auto target = targetTransform(
+                  static_cast<void*>(curTarget.data()),
+                  {static_cast<dim_t>(curTarget.size())},
+                  af::dtype::b8);
+
+              newTargets.push_back(target);
+              newTargetsSize.push_back(
+                  af::constant(float(target.elements()), 1));
+            }
+            fl::ext::syncMeter(unsupQuality);
+            if (fl::getWorldRank() == 0) {
+              std::cout << "PL Quality for Batch " << curBatch << " : "
+                        << unsupQuality.errorRate()[0] << std::endl;
+            }
+
+            fl::Dataset::BatchFunction fnc =
+                [targetpadVal](const std::vector<af::array>& arr) {
+                  return fl::join(arr, targetpadVal, 1);
+                };
+            newTargetsSizeBatch = fl::makeBatch(newTargetsSize, nullptr);
+            newTargetsBatch = fl::makeBatch(newTargets, fnc);
+            meters.stats.add(batchUnsup[kDurationIdx], newTargetsSizeBatch);
+            critArgsUnsup = {outputUnsup, fl::Variable(newTargetsBatch, false)};
+            if (isSeq2seqCrit) {
+              critArgsUnsup.push_back(
+                  fl::Variable(batchUnsup[kDurationIdx], false));
+              critArgsUnsup.push_back(fl::Variable(newTargetsSizeBatch, false));
+            }
+          }
+          af::sync();
+          meters.critfwdtimer.resume();
+          auto loss1 = fl::sum(crit->forward(critArgs).front(), {0});
+          auto loss = loss1;
+          fl::Variable loss2;
+          if (useUnsup) {
+            loss2 = fl::sum(crit->forward(critArgsUnsup).front(), {0});
+            loss = loss + loss2;
+          }
           af::sync();
           meters.fwdtimer.stopAndIncUnit();
           meters.critfwdtimer.stopAndIncUnit();
@@ -1098,6 +1149,13 @@ int main(int argc, char** argv) {
                 batch[kTargetIdx],
                 batch[kDurationIdx],
                 meters.train);
+            if (useUnsup) {
+              evalOutput(
+                  outputUnsup.array(),
+                  newTargetsBatch,
+                  batchUnsup[kDurationIdx],
+                  meters.trainUnsup);
+            }
           }
 
           // backward
@@ -1117,6 +1175,10 @@ int main(int argc, char** argv) {
           // scale down gradients by batchsize
           af::array totalBatchSizeArr =
               af::constant(batch[kInputIdx].dims(3), 1, f32);
+          if (useUnsup) {
+            totalBatchSizeArr =
+                totalBatchSizeArr + batchUnsup[kInputIdx].dims(3);
+          }
           if (reducer) {
             fl::allReduce(totalBatchSizeArr);
           }
@@ -1145,7 +1207,10 @@ int main(int argc, char** argv) {
             continue;
           }
 
-          meters.train.loss.add((loss / scaleFactor).array());
+          meters.train.loss.add(loss1.array());
+          if (useUnsup) {
+            meters.trainUnsup.loss.add(loss2.array());
+          }
 
           for (const auto& p : crit->params()) {
             if (!p.isGradAvailable()) {
@@ -1206,18 +1271,6 @@ int main(int argc, char** argv) {
         runValAndSaveModel(
             curEpoch, curBatch, netopt->getLr(), critopt->getLr());
       }
-
-      // Try regenerate PL
-      auto newUnsupDataDir =
-          plGenerator.regeneratePl(curEpoch, ntwrk, crit, usePlugin);
-      if (!newUnsupDataDir.empty()) {
-        trainset = plGenerator.createTrainSet(
-            FLAGS_datadir,
-            FLAGS_train,
-            newUnsupDataDir,
-            FLAGS_batching_strategy,
-            FLAGS_batching_max_duration);
-      }
     }
   };
 
@@ -1227,6 +1280,7 @@ int main(int argc, char** argv) {
         network,
         linseg,
         trainds,
+        unsupTrainds,
         linNetoptim,
         linCritoptim,
         initLinNetlr,
@@ -1247,7 +1301,8 @@ int main(int argc, char** argv) {
     train(
         network,
         criterion,
-        trainds,
+        traindsNoUnsup,
+        nullptr,
         netoptim,
         critoptim,
         FLAGS_lr,
@@ -1266,7 +1321,20 @@ int main(int argc, char** argv) {
   train(
       network,
       criterion,
+      traindsNoUnsup,
+      nullptr,
+      netoptim,
+      critoptim,
+      FLAGS_lr,
+      FLAGS_lrcrit,
+      true /* clampCrit */,
+      FLAGS_slimIPL_start - FLAGS_pretrainWindow);
+
+  train(
+      network,
+      criterion,
       trainds,
+      unsupTrainds,
       netoptim,
       critoptim,
       FLAGS_lr,

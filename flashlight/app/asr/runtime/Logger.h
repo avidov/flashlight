@@ -31,6 +31,7 @@ struct TrainMeters {
   fl::TimeMeter optimtimer{true};
 
   DatasetMeters train;
+  DatasetMeters trainUnsup;
   std::map<std::string, DatasetMeters> valid;
 
   SpeechStatMeter stats;

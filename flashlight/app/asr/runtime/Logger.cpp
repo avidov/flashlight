@@ -97,6 +97,11 @@ std::string getLogString(
       timeTakenSec > 0.0 ? format("%.2f", isztotal / 1000 / timeTakenSec)
                          : "n/a");
   insertItem("timestamp", getCurrentDate() + " " + getCurrentTime());
+  insertItem("loss Unsup", format("%10.5f", meters.trainUnsup.loss.value()[0]));
+
+  insertItem("train-TER Unsup", format("%5.2f", meters.trainUnsup.tknEdit.errorRate()[0]));
+  insertItem("train-WER Unsup", format("%5.2f", meters.trainUnsup.wrdEdit.errorRate()[0]));
+  
   return status;
 }
 
@@ -146,6 +151,9 @@ void syncMeter(TrainMeters& mtrs) {
   fl::ext::syncMeter(mtrs.train.tknEdit);
   fl::ext::syncMeter(mtrs.train.wrdEdit);
   fl::ext::syncMeter(mtrs.train.loss);
+  fl::ext::syncMeter(mtrs.trainUnsup.tknEdit);
+  fl::ext::syncMeter(mtrs.trainUnsup.wrdEdit);
+  fl::ext::syncMeter(mtrs.trainUnsup.loss);
   for (auto& v : mtrs.valid) {
     fl::ext::syncMeter(v.second.tknEdit);
     fl::ext::syncMeter(v.second.wrdEdit);
