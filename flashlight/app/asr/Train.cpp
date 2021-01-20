@@ -1072,7 +1072,10 @@ int main(int argc, char** argv) {
         // - https://arxiv.org/abs/1710.03740
         // - https://bit.ly/35F5GqX
         // - https://bit.ly/3mn2qr0
-        fl::Variable inputUnsupOriginal = fl::input(batchUnsup[kInputIdx]);
+        fl::Variable inputUnsupOriginal;
+        if (useUnsup) {
+          inputUnsupOriginal = fl::input(batchUnsup[kInputIdx]);
+        }
         bool retrySample = false;
         do {
           retrySample = false;
