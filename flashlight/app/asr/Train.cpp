@@ -71,6 +71,7 @@ DEFINE_string(
     "comma-separated list of unsupervised training data");
 DEFINE_int64(slimIPL_start, 0, "updates to start slimIPL");
 DEFINE_string(slimIPL_type, "naive", "naive - relabel then bwd;");
+DEFINE_bool(slimIPL_loadCache, true, "load cache for continue mode");
 } // namespace
 
 int main(int argc, char** argv) {
@@ -238,6 +239,7 @@ int main(int argc, char** argv) {
   }
 
   /* ===================== Create Dataset ===================== */
+  std::unordered_map<std::string, std::string> plCache;
   fl::lib::audio::FeatureParams featParams(
       FLAGS_samplerate,
       FLAGS_framesizems,
@@ -418,8 +420,20 @@ int main(int argc, char** argv) {
   } else { // kContinueMode
     std::unordered_map<std::string, std::string> cfg; // unused
     std::string version;
-    Serializer::load(
-        reloadPath, version, cfg, network, criterion, netoptim, critoptim);
+    if (FLAGS_slimIPL_type == "cache" && FLAGS_slimIPL_loadCache) {
+      Serializer::load(
+          reloadPath,
+          version,
+          cfg,
+          network,
+          criterion,
+          netoptim,
+          critoptim,
+          plCache);
+    } else {
+      Serializer::load(
+          reloadPath, version, cfg, network, criterion, netoptim, critoptim);
+    }
     if (version != FL_APP_ASR_VERSION) {
       LOG(WARNING) << "Model version " << version << " and code version "
                    << FL_APP_ASR_VERSION;
@@ -612,7 +626,8 @@ int main(int argc, char** argv) {
             network,
             criterion,
             netoptim,
-            critoptim);
+            critoptim,
+            plCache);
       }
 
       // save last model
@@ -624,7 +639,8 @@ int main(int argc, char** argv) {
           network,
           criterion,
           netoptim,
-          critoptim);
+          critoptim,
+          plCache);
 
       // save if better than ever for one valid
       for (const auto& v : validminerrs) {
@@ -641,7 +657,8 @@ int main(int argc, char** argv) {
               network,
               criterion,
               netoptim,
-              critoptim);
+              critoptim,
+              plCache);
         }
       }
 
@@ -660,7 +677,8 @@ int main(int argc, char** argv) {
               network,
               criterion,
               netoptim,
-              critoptim);
+              critoptim,
+              plCache);
         }
       }
       // print brief stats on memory allocation (so far)
@@ -830,6 +848,7 @@ int main(int argc, char** argv) {
                 &targetTransform,
                 &tokenToWord,
                 &targetpadVal,
+                &plCache,
                 reducer](
                    std::shared_ptr<fl::Module> ntwrk,
                    std::shared_ptr<SequenceCriterion> crit,
@@ -1007,6 +1026,45 @@ int main(int argc, char** argv) {
                      << join(",", readSampleIds(batch[kSampleIdx]));
         }
 
+        auto predictPL = [&](fl::Variable inp) -> std::vector<std::string> {
+          ntwrk->eval();
+          crit->eval();
+          auto outputUnsupOriginal =
+              ntwrk->forward({inp, fl::noGrad(batchUnsup[kDurationIdx])})
+                  .front();
+          auto viterbiPath = crit->viterbiPath(
+              outputUnsupOriginal.array(), batchUnsup[kDurationIdx]);
+
+          ntwrk->train();
+          crit->train();
+          unsupQuality.reset();
+
+          if (curBatch % 100 == 0) {
+            FL_LOG_MASTER(INFO)
+                << "PL for samples "
+                << join(",", readSampleIds(batchUnsup[kSampleIdx]));
+          }
+          std::vector<std::string> plTextArray;
+          for (int index = 0; index < viterbiPath.dims(1); index++) {
+            auto tokenPrediction = afToVector<int>(viterbiPath.col(index));
+            auto plArray = tokenToWord(tokenPrediction, true);
+            auto plTrueArray = tokenToWord(
+                afToVector<int>(batchUnsup[kTargetIdx].col(index)), false);
+            auto plText = fl::lib::join(" ", plArray);
+            if (curBatch % 100 == 0) {
+              FL_LOG_MASTER(INFO) << "PL for index " << index << ": " << plText;
+            }
+            unsupQuality.add(plArray, plTrueArray);
+            plTextArray.push_back(plText);
+          }
+          fl::ext::syncMeter(unsupQuality);
+          if (fl::getWorldRank() == 0) {
+            std::cout << "PL Quality for Batch " << curBatch << " : "
+                      << unsupQuality.errorRate()[0] << std::endl;
+          }
+          return plTextArray;
+        };
+
         // Ensure no samples are skipped while adjusting the loss scale factor.
         // When gradient values are Inf/NaN, the model update is skipped and the
         // scale factor is adjusted accordingly for determinism.
@@ -1014,23 +1072,23 @@ int main(int argc, char** argv) {
         // - https://arxiv.org/abs/1710.03740
         // - https://bit.ly/35F5GqX
         // - https://bit.ly/3mn2qr0
+        fl::Variable inputUnsupOriginal = fl::input(batchUnsup[kInputIdx]);
         bool retrySample = false;
         do {
           retrySample = false;
           // forward
           meters.fwdtimer.resume();
           auto input = fl::input(batch[kInputIdx]);
-          fl::Variable inputUnsup, inputUnsupOriginal, outputUnsup,
-              outputUnsupOriginal;
+          fl::Variable inputUnsup, outputUnsup;
           std::vector<fl::Variable> critArgsUnsup;
           if (useUnsup) {
-            inputUnsupOriginal = fl::input(batchUnsup[kInputIdx]);
+            inputUnsup = fl::input(batchUnsup[kInputIdx]);
           }
           if (FLAGS_saug_start_update >= 0 &&
               curBatch >= FLAGS_saug_start_update) {
             input = saug->forward({input}).front();
             if (useUnsup) {
-              inputUnsup = saug->forward({inputUnsupOriginal}).front();
+              inputUnsup = saug->forward({inputUnsup}).front();
             }
           }
           auto output =
@@ -1041,81 +1099,83 @@ int main(int argc, char** argv) {
             critArgs.push_back(fl::Variable(batch[kDurationIdx], false));
             critArgs.push_back(fl::Variable(batch[kTargetSizeIdx], false));
           }
-          af::array newTargetsBatch, newTargetsSizeBatch;
+
+          af::array newUnsupDuration;
           if (useUnsup) {
             outputUnsup = ntwrk
                               ->forward({inputUnsup,
                                          fl::noGrad(batchUnsup[kDurationIdx])})
                               .front();
-            ntwrk->eval();
-            crit->eval();
-            outputUnsupOriginal =
-                ntwrk
-                    ->forward({inputUnsupOriginal,
-                               fl::noGrad(batchUnsup[kDurationIdx])})
-                    .front();
-            auto viterbiPath = crit->viterbiPath(
-                outputUnsupOriginal.array(), batchUnsup[kDurationIdx]);
 
-            ntwrk->train();
-            crit->train();
-
-            unsupQuality.reset();
-
-            std::vector<af::array> newTargets, newTargetsSize;
-            if (curBatch % 100 == 0) {
-              FL_LOG_MASTER(INFO)
-                  << "PL for samples "
-                  << join(",", readSampleIds(batchUnsup[kSampleIdx]));
-            }
-            for (int index = 0; index < viterbiPath.dims(1); index++) {
-              auto tokenPrediction = afToVector<int>(viterbiPath.col(index));
-              auto plArray = tokenToWord(tokenPrediction, true);
-              auto plTrueArray = tokenToWord(afToVector<int>(batchUnsup[kTargetIdx].col(index)), false);
-              auto plText = fl::lib::join(" ", plArray);
-              if (curBatch % 100 == 0) {
-                FL_LOG_MASTER(INFO)
-                    << "PL for index " << index << ": " << plText;
+            std::vector<std::string> plTextArray;
+            std::vector<int> useUnsupSamplesIndices;
+            if (FLAGS_slimIPL_type == "naive") {
+              // generate by current NN the labels;
+              plTextArray = predictPL(inputUnsupOriginal);
+              useUnsupSamplesIndices = std::vector<int>(plTextArray.size());
+              std::iota(
+                  useUnsupSamplesIndices.begin(),
+                  useUnsupSamplesIndices.end(),
+                  0);
+            } else if (FLAGS_slimIPL_type == "cache") {
+              auto samplesIndices = readSampleIds(batchUnsup[kSampleIdx]);
+              for (int index = 0; index < samplesIndices.size(); index++) {
+                if (plCache.find(samplesIndices[index]) != plCache.end()) { // place to add filtering too
+                  useUnsupSamplesIndices.push_back(index);
+                  plTextArray.push_back(plCache[samplesIndices[index]]);
+                }
               }
-              unsupQuality.add(plArray, plTrueArray);
-              std::vector<char> curTarget(plText.begin(), plText.end());
-              auto target = targetTransform(
-                  static_cast<void*>(curTarget.data()),
-                  {static_cast<dim_t>(curTarget.size())},
-                  af::dtype::b8);
-
-              newTargets.push_back(target);
-              newTargetsSize.push_back(
-                  af::constant(float(target.elements()), 1));
-            }
-            fl::ext::syncMeter(unsupQuality);
-            if (fl::getWorldRank() == 0) {
-              std::cout << "PL Quality for Batch " << curBatch << " : "
-                        << unsupQuality.errorRate()[0] << std::endl;
             }
 
-            fl::Dataset::BatchFunction fnc =
-                [targetpadVal](const std::vector<af::array>& arr) {
-                  return fl::join(arr, targetpadVal, 1);
-                };
-            newTargetsSizeBatch = fl::makeBatch(newTargetsSize, nullptr);
-            newTargetsBatch = fl::makeBatch(newTargets, fnc);
-            meters.stats.add(batchUnsup[kDurationIdx], newTargetsSizeBatch);
-            critArgsUnsup = {outputUnsup, fl::Variable(newTargetsBatch, false)};
-            if (isSeq2seqCrit) {
-              critArgsUnsup.push_back(
-                  fl::Variable(batchUnsup[kDurationIdx], false));
-              critArgsUnsup.push_back(fl::Variable(newTargetsSizeBatch, false));
+            if (useUnsupSamplesIndices.size() > 0) {
+              af::array maskedSamples = af::array(
+                  af::dim4(useUnsupSamplesIndices.size()),
+                  useUnsupSamplesIndices.data());
+              std::vector<af::array> newTargets, newTargetsSize;
+              for (auto& plText : plTextArray) {
+                std::vector<char> curTarget(plText.begin(), plText.end());
+                auto target = targetTransform(
+                    static_cast<void*>(curTarget.data()),
+                    {static_cast<dim_t>(curTarget.size())},
+                    af::dtype::b8);
+
+                newTargets.push_back(target);
+                newTargetsSize.push_back(
+                    af::constant(float(target.elements()), 1));
+              }
+              fl::Dataset::BatchFunction fnc =
+                  [targetpadVal](const std::vector<af::array>& arr) {
+                    return fl::join(arr, targetpadVal, 1);
+                  };
+              auto newTargetsSizeBatch = fl::makeBatch(newTargetsSize, nullptr);
+              auto newTargetsBatch = fl::makeBatch(newTargets, fnc);
+              meters.stats.add(
+                  batchUnsup[kDurationIdx](maskedSamples), newTargetsSizeBatch);
+              // TODO optimize masking early
+              critArgsUnsup = {
+                  outputUnsup(
+                      af::span, af::span, maskedSamples, af::span, true),
+                  fl::Variable(newTargetsBatch, false)};
+              newUnsupDuration = batchUnsup[kDurationIdx](maskedSamples);
+              if (isSeq2seqCrit) {
+                critArgsUnsup.push_back(fl::Variable(newUnsupDuration, false));
+                critArgsUnsup.push_back(
+                    fl::Variable(newTargetsSizeBatch, false));
+              }
+            } else {
+              LOG(INFO)
+                  << "Skip unsupervised part of data as PL are not available yet";
             }
           }
+
           af::sync();
           meters.critfwdtimer.resume();
-          auto loss1 = fl::sum(crit->forward(critArgs).front(), {0});
-          auto loss = loss1;
+          auto loss1 = crit->forward(critArgs).front();
+          auto loss = fl::sum(loss1, {0});
           fl::Variable loss2;
-          if (useUnsup) {
-            loss2 = fl::sum(crit->forward(critArgsUnsup).front(), {0});
-            loss = loss + loss2;
+          if (useUnsup && critArgsUnsup.size() > 0) {
+            loss2 = crit->forward(critArgsUnsup).front();
+            loss = loss + fl::sum(loss2, {0});
           }
           af::sync();
           meters.fwdtimer.stopAndIncUnit();
@@ -1149,11 +1209,11 @@ int main(int argc, char** argv) {
                 batch[kTargetIdx],
                 batch[kDurationIdx],
                 meters.train);
-            if (useUnsup) {
+            if (useUnsup && critArgsUnsup.size() > 0) {
               evalOutput(
-                  outputUnsup.array(),
-                  newTargetsBatch,
-                  batchUnsup[kDurationIdx],
+                  critArgsUnsup[0].array(),
+                  critArgsUnsup[1].array(),
+                  newUnsupDuration,
                   meters.trainUnsup);
             }
           }
@@ -1173,11 +1233,9 @@ int main(int argc, char** argv) {
           meters.optimtimer.resume();
 
           // scale down gradients by batchsize
-          af::array totalBatchSizeArr =
-              af::constant(batch[kInputIdx].dims(3), 1, f32);
+          af::array totalBatchSizeArr = af::constant(loss1.dims(0), 1, f32);
           if (useUnsup) {
-            totalBatchSizeArr =
-                totalBatchSizeArr + batchUnsup[kInputIdx].dims(3);
+            totalBatchSizeArr = totalBatchSizeArr + loss2.dims(0);
           }
           if (reducer) {
             fl::allReduce(totalBatchSizeArr);
@@ -1208,7 +1266,7 @@ int main(int argc, char** argv) {
           }
 
           meters.train.loss.add(loss1.array());
-          if (useUnsup) {
+          if (useUnsup && !loss2.array().isempty()) {
             meters.trainUnsup.loss.add(loss2.array());
           }
 
@@ -1235,6 +1293,16 @@ int main(int argc, char** argv) {
         critopt->step();
         netopt->step();
         af::sync();
+        if (useUnsup) {
+          if (FLAGS_slimIPL_type == "cache") {
+            auto plTextArray = predictPL(inputUnsupOriginal);
+            auto sampleIndices = readSampleIds(batchUnsup[kSampleIdx]);
+            for (int index = 0; index < plTextArray.size(); index++) {
+              plCache[sampleIndices[index]] = plTextArray[index];
+            }
+          }
+        }
+
         meters.optimtimer.stopAndIncUnit();
 
         // update scale factor
@@ -1318,17 +1386,19 @@ int main(int argc, char** argv) {
     trde->clearWindow();
   }
 
-  train(
-      network,
-      criterion,
-      traindsNoUnsup,
-      nullptr,
-      netoptim,
-      critoptim,
-      FLAGS_lr,
-      FLAGS_lrcrit,
-      true /* clampCrit */,
-      FLAGS_slimIPL_start - FLAGS_pretrainWindow);
+  if (FLAGS_slimIPL_start - startUpdate > 0) {
+    train(
+        network,
+        criterion,
+        traindsNoUnsup,
+        nullptr,
+        netoptim,
+        critoptim,
+        FLAGS_lr,
+        FLAGS_lrcrit,
+        true /* clampCrit */,
+        FLAGS_slimIPL_start);
+  }
 
   train(
       network,
