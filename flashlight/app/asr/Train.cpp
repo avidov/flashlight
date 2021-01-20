@@ -1117,12 +1117,22 @@ int main(int argc, char** argv) {
                   useUnsupSamplesIndices.begin(),
                   useUnsupSamplesIndices.end(),
                   0);
-            } else if (FLAGS_slimIPL_type == "cache") {
+            } else if (
+                FLAGS_slimIPL_type == "cache" ||
+                FLAGS_slimIPL_type == "pre-cache") {
               auto samplesIndices = readSampleIds(batchUnsup[kSampleIdx]);
               for (int index = 0; index < samplesIndices.size(); index++) {
-                if (plCache.find(samplesIndices[index]) != plCache.end()) { // place to add filtering too
+                if (plCache.find(samplesIndices[index]) !=
+                    plCache.end()) { // place to add filtering too
                   useUnsupSamplesIndices.push_back(index);
                   plTextArray.push_back(plCache[samplesIndices[index]]);
+                }
+              }
+              if (FLAGS_slimIPL_type == "pre-cache") {
+                // update Cache before doing model update
+                auto plTextArrayPreCache = predictPL(inputUnsupOriginal);
+                for (int index = 0; index < plTextArrayPreCache.size(); index++) {
+                  plCache[samplesIndices[index]] = plTextArrayPreCache[index];
                 }
               }
             }
@@ -1296,9 +1306,9 @@ int main(int argc, char** argv) {
         if (useUnsup) {
           if (FLAGS_slimIPL_type == "cache") {
             auto plTextArray = predictPL(inputUnsupOriginal);
-            auto sampleIndices = readSampleIds(batchUnsup[kSampleIdx]);
+            auto samplesIndices = readSampleIds(batchUnsup[kSampleIdx]);
             for (int index = 0; index < plTextArray.size(); index++) {
-              plCache[sampleIndices[index]] = plTextArray[index];
+              plCache[samplesIndices[index]] = plTextArray[index];
             }
           }
         }
