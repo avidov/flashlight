@@ -418,15 +418,28 @@ int main(int argc, char** argv) {
         std::ifstream fcache;
         auto cacheName = getRunFile("model_last_cache", runIdx - 1, runPath) +
             std::to_string(processIdx);
+        if (!fileExists(cacheName)) {
+          LOG(INFO) << "Read cache from " << cacheName << "; Skip, file doesn't exist";
+          continue;
+        }
         fcache.open(cacheName);
-        std::string key, value;
-        while (!fcache.eof()) {
-          fcache >> key >> value;
-          plCacheDump[key] = value;
+        std::string line;
+        int count = 0;
+        while (getline(fcache, line)) {
+          auto tmp = fl::lib::split("|", line);
+          if (tmp.size() == 0) {
+            continue;
+          } else if (tmp.size() == 1) {
+            plCacheDump[tmp[0]] = "";
+          } else {
+            plCacheDump[tmp[0]] = tmp[1];
+          }
+          count++;
         }
         fcache.close();
+        LOG(INFO) << "Read cache from " << cacheName << " with number of samples " << count;
       }
-      LOG(INFO) << "Reading PL cache is done";
+      LOG(INFO) << "Reading PL cache is done; total size " << plCacheDump.size();
     }
     if (version != FL_APP_ASR_VERSION) {
       LOG(WARNING) << "Model version " << version << " and code version "
@@ -610,7 +623,7 @@ int main(int argc, char** argv) {
           std::to_string(worldRank);
       fcache.open(cacheName);
       for (auto const& element : plCache) {
-        fcache << element.first << " " << element.second << std::endl;
+        fcache << element.first << "|" << element.second << std::endl;
       }
       fcache.close();
     }
