@@ -71,7 +71,9 @@ DEFINE_string(
     "comma-separated list of unsupervised training data");
 DEFINE_int64(slimIPL_start, 0, "updates to start slimIPL");
 DEFINE_string(slimIPL_type, "naive", "naive - relabel then bwd;");
-DEFINE_bool(slimIPL_loadCache, true, "load cache for continue mode");
+DEFINE_string(slimIPL_cache_path, "", "path to save/load cache");
+DEFINE_int64(slimIPL_sup_updates, 1, "number of supervised updates");
+DEFINE_int64(slimIPL_unsup_updates, 3, "number of unsupervised updates");
 } // namespace
 
 int main(int argc, char** argv) {
@@ -240,6 +242,8 @@ int main(int argc, char** argv) {
 
   /* ===================== Create Dataset ===================== */
   std::unordered_map<std::string, std::string> plCache;
+  std::unordered_map<std::string, std::string> plCacheDump;
+
   fl::lib::audio::FeatureParams featParams(
       FLAGS_samplerate,
       FLAGS_framesizems,
@@ -294,20 +298,6 @@ int main(int argc, char** argv) {
       trainSplits,
       FLAGS_datadir,
       FLAGS_batchsize,
-      inputTransform,
-      targetTransform,
-      wordTransform,
-      padVal,
-      worldRank,
-      worldSize,
-      false, // allowEmpty
-      FLAGS_batching_strategy,
-      FLAGS_batching_max_duration);
-
-  auto traindsNoUnsup = createDataset(
-      trainSplits,
-      FLAGS_datadir,
-      FLAGS_batchsize * 2,
       inputTransform,
       targetTransform,
       wordTransform,
@@ -420,19 +410,23 @@ int main(int argc, char** argv) {
   } else { // kContinueMode
     std::unordered_map<std::string, std::string> cfg; // unused
     std::string version;
-    if (FLAGS_slimIPL_type == "cache" && FLAGS_slimIPL_loadCache) {
-      Serializer::load(
-          reloadPath,
-          version,
-          cfg,
-          network,
-          criterion,
-          netoptim,
-          critoptim,
-          plCache);
-    } else {
-      Serializer::load(
-          reloadPath, version, cfg, network, criterion, netoptim, critoptim);
+    Serializer::load(
+        reloadPath, version, cfg, network, criterion, netoptim, critoptim);
+    if (FLAGS_slimIPL_type == "cache" || FLAGS_slimIPL_type == "pre-cache") {
+      LOG(INFO) << "Reading PL cache";
+      for (int processIdx = 0; processIdx < worldSize; processIdx++) {
+        std::ifstream fcache;
+        auto cacheName = getRunFile("model_last_cache", runIdx - 1, runPath) +
+            std::to_string(processIdx);
+        fcache.open(cacheName);
+        std::string key, value;
+        while (!fcache.eof()) {
+          fcache >> key >> value;
+          plCacheDump[key] = value;
+        }
+        fcache.close();
+      }
+      LOG(INFO) << "Reading PL cache is done";
     }
     if (version != FL_APP_ASR_VERSION) {
       LOG(WARNING) << "Model version " << version << " and code version "
@@ -610,6 +604,16 @@ int main(int argc, char** argv) {
   }
 
   auto saveModels = [&](int iter, int totalUpdates) {
+    if (FLAGS_slimIPL_type == "pre-cache" || FLAGS_slimIPL_type == "cache") {
+      std::ofstream fcache;
+      auto cacheName = getRunFile("model_last_cache", runIdx, runPath) +
+          std::to_string(worldRank);
+      fcache.open(cacheName);
+      for (auto const& element : plCache) {
+        fcache << element.first << " " << element.second << std::endl;
+      }
+      fcache.close();
+    }
     if (isMaster) {
       // Save last epoch
       config[kEpoch] = std::to_string(iter);
@@ -626,8 +630,7 @@ int main(int argc, char** argv) {
             network,
             criterion,
             netoptim,
-            critoptim,
-            plCache);
+            critoptim);
       }
 
       // save last model
@@ -639,8 +642,7 @@ int main(int argc, char** argv) {
           network,
           criterion,
           netoptim,
-          critoptim,
-          plCache);
+          critoptim);
 
       // save if better than ever for one valid
       for (const auto& v : validminerrs) {
@@ -657,8 +659,7 @@ int main(int argc, char** argv) {
               network,
               criterion,
               netoptim,
-              critoptim,
-              plCache);
+              critoptim);
         }
       }
 
@@ -677,8 +678,7 @@ int main(int argc, char** argv) {
               network,
               criterion,
               netoptim,
-              critoptim,
-              plCache);
+              critoptim);
         }
       }
       // print brief stats on memory allocation (so far)
@@ -849,6 +849,7 @@ int main(int argc, char** argv) {
                 &tokenToWord,
                 &targetpadVal,
                 &plCache,
+                &plCacheDump,
                 reducer](
                    std::shared_ptr<fl::Module> ntwrk,
                    std::shared_ptr<SequenceCriterion> crit,
@@ -961,6 +962,8 @@ int main(int argc, char** argv) {
         FLAGS_fl_amp_scale_factor_update_interval;
     unsigned int kMaxScaleFactor = FLAGS_fl_amp_max_scale_factor;
     unsigned short scaleCounter = 1;
+    bool useUnsup = !(unsupTrainset == nullptr);
+    FL_LOG_MASTER(INFO) << "Unsup is in use " << useUnsup;
     while (curBatch < nbatches) {
       ++curEpoch; // counts partial epochs too!
       int64_t epochsAfterDecay = curEpoch - FLAGS_lr_decay;
@@ -975,31 +978,61 @@ int main(int argc, char** argv) {
       }
       std::hash<std::string> hasher;
       FL_LOG_MASTER(INFO) << "Shuffling trainset";
-      bool useUnsup = !(unsupTrainset == nullptr);
-      FL_LOG_MASTER(INFO) << "Unsup is in use " << useUnsup;
       auto curTrainset = loadPrefetchDataset(
           trainset, FLAGS_nthread, true /* shuffle */, curEpoch /* seed */);
       std::shared_ptr<fl::Dataset> curUnsupTrainset;
       if (useUnsup) {
+        FL_LOG_MASTER(INFO) << "Shuffling unsup trainset";
         curUnsupTrainset = loadPrefetchDataset(
             unsupTrainset,
             FLAGS_nthread,
             true /* shuffle */,
-            curEpoch /* seed */);
+            curBatch /* seed */);
       }
       af::sync();
       meters.sampletimer.resume();
       meters.runtime.resume();
       meters.timer.resume();
       FL_LOG_MASTER(INFO) << "Epoch " << curEpoch << " started!";
-      int unsupBatchIdx = -1;
-      for (auto& batch : *curTrainset) {
-        ++unsupBatchIdx;
+      int unsupBatchIdx = 0, supBatchIdx = 0, setsOrderIdx = 0;
+      std::vector<bool> setsOrder;
+      int unsupSteps = useUnsup ? FLAGS_slimIPL_unsup_updates : 0;
+      for (int index = 0; index < FLAGS_slimIPL_sup_updates + unsupSteps;
+           index++) {
+        if (index < FLAGS_slimIPL_sup_updates) {
+          setsOrder.push_back(true);
+        } else {
+          setsOrder.push_back(false);
+        }
+      }
+      std::random_shuffle(setsOrder.begin(), setsOrder.end());
+      while (supBatchIdx < curTrainset->size()) {
         ++curBatch;
-        std::vector<af::array> batchUnsup;
-        if (useUnsup) {
-          batchUnsup =
+        std::vector<af::array> batch;
+        bool isSupBatch = setsOrder[setsOrderIdx];
+        if (isSupBatch) {
+          LOG(INFO) << "Sup batch " << curBatch;
+          batch = curTrainset->get(supBatchIdx % curTrainset->size());
+          ++supBatchIdx;
+        } else {
+          LOG(INFO) << "Unsup batch " << curBatch;
+          batch =
               curUnsupTrainset->get(unsupBatchIdx % curUnsupTrainset->size());
+          ++unsupBatchIdx;
+          if (unsupBatchIdx >= curUnsupTrainset->size()) {
+            unsupBatchIdx = 0;
+            FL_LOG_MASTER(INFO) << "Shuffling unsup trainset";
+            curUnsupTrainset = loadPrefetchDataset(
+                unsupTrainset,
+                FLAGS_nthread,
+                true /* shuffle */,
+                curBatch /* seed */);
+          }
+        }
+        setsOrderIdx++;
+        if (setsOrderIdx >= setsOrder.size()) {
+          setsOrderIdx = 0;
+          std::random_shuffle(setsOrder.begin(), setsOrder.end());
         }
         double lrScheduleScale;
         if (FLAGS_lrcosine) {
@@ -1019,21 +1052,26 @@ int main(int argc, char** argv) {
         af::sync();
         meters.timer.incUnit();
         meters.sampletimer.stopAndIncUnit();
-        meters.stats.add(batch[kDurationIdx], batch[kTargetSizeIdx]);
+        if (isSupBatch) {
+          meters.stats.add(batch[kDurationIdx], batch[kTargetSizeIdx]);
+        }
         if (af::anyTrue<bool>(af::isNaN(batch[kInputIdx])) ||
             af::anyTrue<bool>(af::isNaN(batch[kTargetIdx]))) {
           LOG(FATAL) << "Sample has NaN values - "
                      << join(",", readSampleIds(batch[kSampleIdx]));
         }
 
-        auto predictPL = [&](fl::Variable inp) -> std::vector<std::string> {
+        auto predictPL =
+            [&](std::vector<af::array> inpBatch) -> std::vector<std::string> {
           ntwrk->eval();
           crit->eval();
           auto outputUnsupOriginal =
-              ntwrk->forward({inp, fl::noGrad(batchUnsup[kDurationIdx])})
+              ntwrk
+                  ->forward({fl::input(inpBatch[kInputIdx]),
+                             fl::noGrad(inpBatch[kDurationIdx])})
                   .front();
           auto viterbiPath = crit->viterbiPath(
-              outputUnsupOriginal.array(), batchUnsup[kDurationIdx]);
+              outputUnsupOriginal.array(), inpBatch[kDurationIdx]);
 
           ntwrk->train();
           crit->train();
@@ -1042,14 +1080,14 @@ int main(int argc, char** argv) {
           if (curBatch % 100 == 0) {
             FL_LOG_MASTER(INFO)
                 << "PL for samples "
-                << join(",", readSampleIds(batchUnsup[kSampleIdx]));
+                << join(",", readSampleIds(inpBatch[kSampleIdx]));
           }
           std::vector<std::string> plTextArray;
           for (int index = 0; index < viterbiPath.dims(1); index++) {
             auto tokenPrediction = afToVector<int>(viterbiPath.col(index));
             auto plArray = tokenToWord(tokenPrediction, true);
             auto plTrueArray = tokenToWord(
-                afToVector<int>(batchUnsup[kTargetIdx].col(index)), false);
+                afToVector<int>(inpBatch[kTargetIdx].col(index)), false);
             auto plText = fl::lib::join(" ", plArray);
             if (curBatch % 100 == 0) {
               FL_LOG_MASTER(INFO) << "PL for index " << index << ": " << plText;
@@ -1072,49 +1110,34 @@ int main(int argc, char** argv) {
         // - https://arxiv.org/abs/1710.03740
         // - https://bit.ly/35F5GqX
         // - https://bit.ly/3mn2qr0
-        fl::Variable inputUnsupOriginal;
-        if (useUnsup) {
-          inputUnsupOriginal = fl::input(batchUnsup[kInputIdx]);
-        }
         bool retrySample = false;
+        bool doUpdate = true;
         do {
           retrySample = false;
           // forward
           meters.fwdtimer.resume();
           auto input = fl::input(batch[kInputIdx]);
-          fl::Variable inputUnsup, outputUnsup;
-          std::vector<fl::Variable> critArgsUnsup;
-          if (useUnsup) {
-            inputUnsup = fl::input(batchUnsup[kInputIdx]);
-          }
           if (FLAGS_saug_start_update >= 0 &&
               curBatch >= FLAGS_saug_start_update) {
             input = saug->forward({input}).front();
-            if (useUnsup) {
-              inputUnsup = saug->forward({inputUnsup}).front();
-            }
           }
           auto output =
               ntwrk->forward({input, fl::noGrad(batch[kDurationIdx])}).front();
-          std::vector<fl::Variable> critArgs = {
-              output, fl::Variable(batch[kTargetIdx], false)};
-          if (isSeq2seqCrit) {
-            critArgs.push_back(fl::Variable(batch[kDurationIdx], false));
-            critArgs.push_back(fl::Variable(batch[kTargetSizeIdx], false));
-          }
-
+          std::vector<fl::Variable> critArgs;
           af::array newUnsupDuration;
-          if (useUnsup) {
-            outputUnsup = ntwrk
-                              ->forward({inputUnsup,
-                                         fl::noGrad(batchUnsup[kDurationIdx])})
-                              .front();
-
+          if (isSupBatch) {
+            critArgs = {output, fl::Variable(batch[kTargetIdx], false)};
+            if (isSeq2seqCrit) {
+              critArgs.push_back(fl::Variable(batch[kDurationIdx], false));
+              critArgs.push_back(fl::Variable(batch[kTargetSizeIdx], false));
+            }
+          } else {
+            // unsup Batch
             std::vector<std::string> plTextArray;
             std::vector<int> useUnsupSamplesIndices;
             if (FLAGS_slimIPL_type == "naive") {
               // generate by current NN the labels;
-              plTextArray = predictPL(inputUnsupOriginal);
+              plTextArray = predictPL(batch);
               useUnsupSamplesIndices = std::vector<int>(plTextArray.size());
               std::iota(
                   useUnsupSamplesIndices.begin(),
@@ -1123,7 +1146,18 @@ int main(int argc, char** argv) {
             } else if (
                 FLAGS_slimIPL_type == "cache" ||
                 FLAGS_slimIPL_type == "pre-cache") {
-              auto samplesIndices = readSampleIds(batchUnsup[kSampleIdx]);
+              auto samplesIndices = readSampleIds(batch[kSampleIdx]);
+              for (int index = 0; index < samplesIndices.size(); index++) {
+                if (plCache.find(samplesIndices[index]) == plCache.end() &&
+                    plCacheDump.find(samplesIndices[index]) !=
+                        plCacheDump.end()) {
+                  LOG(INFO) << "Reuse extra loaded cache for sample "
+                            << samplesIndices[index] << " for batch " << curBatch;
+                  plCache[samplesIndices[index]] =
+                      plCacheDump[samplesIndices[index]];
+                }
+              }
+
               for (int index = 0; index < samplesIndices.size(); index++) {
                 if (plCache.find(samplesIndices[index]) !=
                     plCache.end()) { // place to add filtering too
@@ -1131,10 +1165,12 @@ int main(int argc, char** argv) {
                   plTextArray.push_back(plCache[samplesIndices[index]]);
                 }
               }
-              if (FLAGS_slimIPL_type == "pre-cache") {
+              if (FLAGS_slimIPL_type == "pre-cache" ||
+                  useUnsupSamplesIndices.size() == 0) {
                 // update Cache before doing model update
-                auto plTextArrayPreCache = predictPL(inputUnsupOriginal);
-                for (int index = 0; index < plTextArrayPreCache.size(); index++) {
+                auto plTextArrayPreCache = predictPL(batch);
+                for (int index = 0; index < plTextArrayPreCache.size();
+                     index++) {
                   plCache[samplesIndices[index]] = plTextArrayPreCache[index];
                 }
               }
@@ -1163,33 +1199,28 @@ int main(int argc, char** argv) {
               auto newTargetsSizeBatch = fl::makeBatch(newTargetsSize, nullptr);
               auto newTargetsBatch = fl::makeBatch(newTargets, fnc);
               meters.stats.add(
-                  batchUnsup[kDurationIdx](maskedSamples), newTargetsSizeBatch);
+                  batch[kDurationIdx](maskedSamples), newTargetsSizeBatch);
               // TODO optimize masking early
-              critArgsUnsup = {
-                  outputUnsup(
-                      af::span, af::span, maskedSamples, af::span, true),
+              critArgs = {
+                  output(af::span, af::span, maskedSamples, af::span, true),
                   fl::Variable(newTargetsBatch, false)};
-              newUnsupDuration = batchUnsup[kDurationIdx](maskedSamples);
+              newUnsupDuration = batch[kDurationIdx](maskedSamples);
               if (isSeq2seqCrit) {
-                critArgsUnsup.push_back(fl::Variable(newUnsupDuration, false));
-                critArgsUnsup.push_back(
-                    fl::Variable(newTargetsSizeBatch, false));
+                critArgs.push_back(fl::Variable(newUnsupDuration, false));
+                critArgs.push_back(fl::Variable(newTargetsSizeBatch, false));
               }
             } else {
               LOG(INFO)
                   << "Skip unsupervised part of data as PL are not available yet";
             }
           }
-
           af::sync();
-          meters.critfwdtimer.resume();
-          auto loss1 = crit->forward(critArgs).front();
-          auto loss = fl::sum(loss1, {0});
-          fl::Variable loss2;
-          if (useUnsup && critArgsUnsup.size() > 0) {
-            loss2 = crit->forward(critArgsUnsup).front();
-            loss = loss + fl::sum(loss2, {0});
+          if (critArgs.size() == 0) {
+            doUpdate = false;
+            break;
           }
+          meters.critfwdtimer.resume();
+          auto loss = crit->forward(critArgs).front();
           af::sync();
           meters.fwdtimer.stopAndIncUnit();
           meters.critfwdtimer.stopAndIncUnit();
@@ -1217,15 +1248,16 @@ int main(int argc, char** argv) {
 
           if (hasher(join(",", readSampleIds(batch[kSampleIdx]))) % 100 <=
               FLAGS_pcttraineval) {
-            evalOutput(
-                output.array(),
-                batch[kTargetIdx],
-                batch[kDurationIdx],
-                meters.train);
-            if (useUnsup && critArgsUnsup.size() > 0) {
+            if (isSupBatch) {
               evalOutput(
-                  critArgsUnsup[0].array(),
-                  critArgsUnsup[1].array(),
+                  critArgs[0].array(),
+                  critArgs[1].array(),
+                  batch[kDurationIdx],
+                  meters.train);
+            } else {
+              evalOutput(
+                  critArgs[0].array(),
+                  critArgs[1].array(),
                   newUnsupDuration,
                   meters.trainUnsup);
             }
@@ -1246,10 +1278,7 @@ int main(int argc, char** argv) {
           meters.optimtimer.resume();
 
           // scale down gradients by batchsize
-          af::array totalBatchSizeArr = af::constant(loss1.dims(0), 1, f32);
-          if (useUnsup) {
-            totalBatchSizeArr = totalBatchSizeArr + loss2.dims(0);
-          }
+          af::array totalBatchSizeArr = af::constant(loss.dims(0), 1, f32);
           if (reducer) {
             fl::allReduce(totalBatchSizeArr);
           }
@@ -1278,9 +1307,10 @@ int main(int argc, char** argv) {
             continue;
           }
 
-          meters.train.loss.add(loss1.array());
-          if (useUnsup && !loss2.array().isempty()) {
-            meters.trainUnsup.loss.add(loss2.array());
+          if (isSupBatch) {
+            meters.train.loss.add(loss.array());
+          } else {
+            meters.trainUnsup.loss.add(loss.array());
           }
 
           for (const auto& p : crit->params()) {
@@ -1291,46 +1321,49 @@ int main(int argc, char** argv) {
           }
 
         } while (retrySample);
-
-        // clamp gradients
-        if (FLAGS_maxgradnorm > 0) {
-          auto params = ntwrk->params();
-          if (clampCrit) {
-            auto critparams = crit->params();
-            params.insert(params.end(), critparams.begin(), critparams.end());
+        if (doUpdate) {
+          // clamp gradients
+          if (FLAGS_maxgradnorm > 0) {
+            auto params = ntwrk->params();
+            if (clampCrit) {
+              auto critparams = crit->params();
+              params.insert(params.end(), critparams.begin(), critparams.end());
+            }
+            fl::clipGradNorm(params, FLAGS_maxgradnorm);
           }
-          fl::clipGradNorm(params, FLAGS_maxgradnorm);
-        }
 
-        // update weights
-        critopt->step();
-        netopt->step();
-        af::sync();
-        if (useUnsup) {
-          if (FLAGS_slimIPL_type == "cache") {
-            auto plTextArray = predictPL(inputUnsupOriginal);
-            auto samplesIndices = readSampleIds(batchUnsup[kSampleIdx]);
-            for (int index = 0; index < plTextArray.size(); index++) {
-              plCache[samplesIndices[index]] = plTextArray[index];
+          // update weights
+          critopt->step();
+          netopt->step();
+          af::sync();
+          if (!isSupBatch) {
+            if (FLAGS_slimIPL_type == "cache") {
+              auto plTextArray = predictPL(batch);
+              auto samplesIndices = readSampleIds(batch[kSampleIdx]);
+              for (int index = 0; index < plTextArray.size(); index++) {
+                plCache[samplesIndices[index]] = plTextArray[index];
+              }
             }
           }
-        }
 
-        meters.optimtimer.stopAndIncUnit();
+          meters.optimtimer.stopAndIncUnit();
 
-        // update scale factor
-        if (FLAGS_fl_amp_use_mixed_precision && scaleFactor < kMaxScaleFactor) {
-          if (scaleCounter % kScaleFactorUpdateInterval == 0) {
-            scaleFactor *= 2;
-            FL_VLOG(2) << "AMP: Scale factor doubled. New value:\t"
-                       << scaleFactor;
-          } else {
-            scaleFactor += 2;
-            FL_VLOG(3) << "AMP: Scale factor incremented. New value\t"
-                       << scaleFactor;
+          // update scale factor
+          if (FLAGS_fl_amp_use_mixed_precision &&
+              scaleFactor < kMaxScaleFactor) {
+            if (scaleCounter % kScaleFactorUpdateInterval == 0) {
+              scaleFactor *= 2;
+              FL_VLOG(2) << "AMP: Scale factor doubled. New value:\t"
+                         << scaleFactor;
+            } else {
+              scaleFactor += 2;
+              FL_VLOG(3) << "AMP: Scale factor incremented. New value\t"
+                         << scaleFactor;
+            }
           }
+        } else {
+          LOG(INFO) << "Skip update step as unsup data has no label " << curBatch;
         }
-
         meters.sampletimer.resume();
 
         if (FLAGS_reportiters > 0 && curBatch % FLAGS_reportiters == 0) {
@@ -1382,7 +1415,7 @@ int main(int argc, char** argv) {
     train(
         network,
         criterion,
-        traindsNoUnsup,
+        unsupTrainds,
         nullptr,
         netoptim,
         critoptim,
@@ -1403,7 +1436,7 @@ int main(int argc, char** argv) {
     train(
         network,
         criterion,
-        traindsNoUnsup,
+        unsupTrainds,
         nullptr,
         netoptim,
         critoptim,
