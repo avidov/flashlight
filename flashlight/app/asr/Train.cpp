@@ -1411,6 +1411,8 @@ int main(int argc, char** argv) {
         FLAGS_lrcrit,
         true /* clampCrit */,
         FLAGS_slimIPL_start);
+    startUpdate = FLAGS_slimIPL_start;
+    FL_LOG_MASTER(INFO) << "Finished supervised only pretraining.";
   }
 
   train(
