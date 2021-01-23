@@ -244,6 +244,8 @@ int main(int argc, char** argv) {
   std::unordered_map<std::string, std::string> plCache;
   std::unordered_map<std::string, std::string> plCacheDump;
 
+  // std::unordered_map<, std::string> plCacheFixedSize;
+
   fl::lib::audio::FeatureParams featParams(
       FLAGS_samplerate,
       FLAGS_framesizems,
@@ -321,6 +323,8 @@ int main(int argc, char** argv) {
       false, // allowEmpty
       FLAGS_batching_strategy,
       FLAGS_batching_max_duration);
+  LOG(INFO) << "Sup batches " << trainds->size() << " | Unsup size "
+            << unsupTrainds->size();
 
   std::map<std::string, std::shared_ptr<fl::Dataset>> validds;
   int64_t validBatchSize =
@@ -419,7 +423,8 @@ int main(int argc, char** argv) {
         auto cacheName = getRunFile("model_last_cache", runIdx - 1, runPath) +
             std::to_string(processIdx);
         if (!fileExists(cacheName)) {
-          LOG(INFO) << "Read cache from " << cacheName << "; Skip, file doesn't exist";
+          LOG(INFO) << "Read cache from " << cacheName
+                    << "; Skip, file doesn't exist";
           continue;
         }
         fcache.open(cacheName);
@@ -437,9 +442,11 @@ int main(int argc, char** argv) {
           count++;
         }
         fcache.close();
-        LOG(INFO) << "Read cache from " << cacheName << " with number of samples " << count;
+        LOG(INFO) << "Read cache from " << cacheName
+                  << " with number of samples " << count;
       }
-      LOG(INFO) << "Reading PL cache is done; total size " << plCacheDump.size();
+      LOG(INFO) << "Reading PL cache is done; total size "
+                << plCacheDump.size();
     }
     if (version != FL_APP_ASR_VERSION) {
       LOG(WARNING) << "Model version " << version << " and code version "
@@ -1024,13 +1031,15 @@ int main(int argc, char** argv) {
         std::vector<af::array> batch;
         bool isSupBatch = setsOrder[setsOrderIdx];
         if (isSupBatch) {
-          LOG(INFO) << "Sup batch " << curBatch;
           batch = curTrainset->get(supBatchIdx % curTrainset->size());
+          LOG(INFO) << "Sup batch " << curBatch << " | " << supBatchIdx << " | "
+                    << batch[kInputIdx].dims();
           ++supBatchIdx;
         } else {
-          LOG(INFO) << "Unsup batch " << curBatch;
           batch =
               curUnsupTrainset->get(unsupBatchIdx % curUnsupTrainset->size());
+          LOG(INFO) << "Unsup batch " << curBatch << " | " << unsupBatchIdx
+                    << " | " << batch[kInputIdx].dims();
           ++unsupBatchIdx;
           if (unsupBatchIdx >= curUnsupTrainset->size()) {
             unsupBatchIdx = 0;
@@ -1164,8 +1173,9 @@ int main(int argc, char** argv) {
                 if (plCache.find(samplesIndices[index]) == plCache.end() &&
                     plCacheDump.find(samplesIndices[index]) !=
                         plCacheDump.end()) {
-                  LOG(INFO) << "Reuse extra loaded cache for sample "
-                            << samplesIndices[index] << " for batch " << curBatch;
+                  LOG(INFO)
+                      << "Reuse extra loaded cache for sample "
+                      << samplesIndices[index] << " for batch " << curBatch;
                   plCache[samplesIndices[index]] =
                       plCacheDump[samplesIndices[index]];
                 }
@@ -1375,7 +1385,8 @@ int main(int argc, char** argv) {
             }
           }
         } else {
-          LOG(INFO) << "Skip update step as unsup data has no label " << curBatch;
+          LOG(INFO) << "Skip update step as unsup data has no label "
+                    << curBatch;
         }
         meters.sampletimer.resume();
 
@@ -1428,7 +1439,7 @@ int main(int argc, char** argv) {
     train(
         network,
         criterion,
-        unsupTrainds,
+        trainds,
         nullptr,
         netoptim,
         critoptim,
@@ -1449,7 +1460,7 @@ int main(int argc, char** argv) {
     train(
         network,
         criterion,
-        unsupTrainds,
+        trainds,
         nullptr,
         netoptim,
         critoptim,
