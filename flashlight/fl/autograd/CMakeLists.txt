@@ -131,3 +131,43 @@ if (FL_USE_OPENCL)
     ${OpenCL_INCLUDE_DIRS}
     )
 endif ()
+
+
+message("-------------------------- FL_USE_MIOPEN=${FL_USE_MIOPEN}")
+# MIOPEN
+if (FL_USE_MIOPEN)
+  set(
+    AUTOGRAD_MIOPEN_SOURCES
+    ${CMAKE_CURRENT_LIST_DIR}/backend/miopen/operators/AdvancedIndex.cpp
+    # ${CMAKE_CURRENT_LIST_DIR}/backend/miopen/BatchNorm.cpp # unsupported by AWS GPU gfx1011
+    ${CMAKE_CURRENT_LIST_DIR}/backend/opencl/BatchNorm.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/backend/miopen/Conv2D.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/backend/miopen/MiOpenUtils.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/backend/miopen/Pool2D.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/backend/miopen/RNN.cpp
+    )
+
+  target_sources(
+    flashlight
+    PRIVATE
+    ${AUTOGRAD_MIOPEN_SOURCES}
+    )
+
+  target_link_libraries(
+    flashlight
+    PUBLIC
+    ${OpenCL_LIBRARIES}
+    )
+
+  target_include_directories(
+    flashlight
+    PUBLIC
+    ${OpenCL_INCLUDE_DIRS}
+    )
+
+  target_compile_definitions(
+    flashlight
+    PRIVATE
+    ${opencl_compile_definitions}
+    )
+endif ()

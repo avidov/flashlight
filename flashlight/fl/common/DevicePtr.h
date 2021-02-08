@@ -70,7 +70,6 @@ class DevicePtr {
  protected:
   af_array arr_;
 
- private:
   void* ptr_;
 };
 

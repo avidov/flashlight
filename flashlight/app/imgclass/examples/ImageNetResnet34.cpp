@@ -7,13 +7,13 @@
 
 #include <exception>
 #include <iomanip>
+#include <iostream>
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
 #include "flashlight/app/imgclass/dataset/Imagenet.h"
-#include "flashlight/app/imgclass/examples/Defines.h"
-#include "flashlight/ext/common/DistributedUtils.h"
+// #include "flashlight/ext/common/DistributedUtils.h"
 #include "flashlight/ext/image/af/Transforms.h"
 #include "flashlight/ext/image/fl/dataset/DistributedDataset.h"
 #include "flashlight/ext/image/fl/models/Resnet.h"
@@ -49,13 +49,17 @@ DEFINE_string(
 DEFINE_uint64(data_batch_size, 256, "Total batch size across all gpus");
 DEFINE_string(exp_checkpoint_path, "/tmp/model", "Checkpointing prefix path");
 DEFINE_int64(exp_checkpoint_epoch, -1, "Checkpoint epoch to load from");
+DEFINE_int64(device, 0, "Device number");
+DEFINE_int64(report_iters, 50, "number of iterations between reports");
 
 using namespace fl;
 using fl::ext::image::compose;
 using fl::ext::image::ImageTransform;
 using namespace fl::app::imgclass;
 
-#define FL_LOG_MASTER(lvl) LOG_IF(lvl, (fl::getWorldRank() == 0))
+int tmp_getWorldRank() { return 0; }
+// #define FL_LOG_MASTER(lvl) LOG_IF(lvl, (tmp_getWorldRank() == 0))
+#define FL_LOG_MASTER(lvl) std::cout 
 
 // Returns the average loss, top 5 error, and top 1 error
 std::tuple<double, double, double> evalLoop(
@@ -80,16 +84,16 @@ std::tuple<double, double, double> evalLoop(
     top1Acc.add(output.array(), target.array());
   }
   model->train();
-  fl::ext::syncMeter(lossMeter);
-  fl::ext::syncMeter(top5Acc);
-  fl::ext::syncMeter(top1Acc);
+  // fl::ext::syncMeter(lossMeter);
+  // fl::ext::syncMeter(top5Acc);
+  // fl::ext::syncMeter(top1Acc);
 
   double loss = lossMeter.value()[0];
   return std::make_tuple(loss, top5Acc.value(), top1Acc.value());
 };
 
 int main(int argc, char** argv) {
-  fl::init();
+  // fl::init();
   google::InitGoogleLogging(argv[0]);
   google::InstallFailureSignalHandler();
   gflags::ParseCommandLineFlags(&argc, &argv, true);
@@ -102,27 +106,30 @@ int main(int argc, char** argv) {
   // Setup distributed training
   ////////////////////////
   af::info();
-  if (FLAGS_distributed_enable) {
-    fl::ext::initDistributed(
-        FLAGS_distributed_world_rank,
-        FLAGS_distributed_world_size,
-        FLAGS_distributed_max_devices_per_node,
-        FLAGS_distributed_rndv_filepath);
-  }
-  const int worldRank = fl::getWorldRank();
-  const int worldSize = fl::getWorldSize();
+  // if (FLAGS_distributed_enable) {
+  //   fl::ext::initDistributed(
+  //       FLAGS_distributed_world_rank,
+  //       FLAGS_distributed_world_size,
+  //       FLAGS_distributed_max_devices_per_node,
+  //       FLAGS_distributed_rndv_filepath);
+  // }
+  const int worldRank = 0; // fl::getWorldRank();
+  const int worldSize = 1 ;// fl::getWorldSize();
   const bool isMaster = (worldRank == 0);
 
-  af::setDevice(worldRank);
+  af::setDevice(FLAGS_device);
+  // af::setDevice(worldRank);
   af::setSeed(worldSize);
 
-  auto reducer =
-      std::make_shared<fl::CoalescingReducer>(1.0 / worldSize, true, true);
+  // auto reducer =
+  //     std::make_shared<fl::CoalescingReducer>(1.0 / worldSize, true, true);
 
   //////////////////////////
   //  Create datasets
   /////////////////////////
   // These are the mean and std for each channel of Imagenet
+  const std::vector<float> mean = {0.485, 0.456, 0.406};
+  const std::vector<float> std = {0.229, 0.224, 0.225};
   const int randomResizeMax = 480;
   const int randomResizeMin = 256;
   const int randomCropSize = 224;
@@ -135,20 +142,20 @@ int main(int argc, char** argv) {
        // scale invariance
        fl::ext::image::randomResizeTransform(randomResizeMin, randomResizeMax),
        fl::ext::image::randomCropTransform(randomCropSize, randomCropSize),
-       fl::ext::image::normalizeImage(
-           fl::app::image::kImageNetMean, fl::app::image::kImageNetStd),
+       fl::ext::image::normalizeImage(mean, std),
        // Randomly flip image with probability of 0.5
        fl::ext::image::randomHorizontalFlipTransform(horizontalFlipProb)});
-  ImageTransform valTransforms = compose(
-      {// Resize shortest side to 256, then take a center crop
-       fl::ext::image::resizeTransform(randomResizeMin),
-       fl::ext::image::centerCropTransform(randomCropSize),
-       fl::ext::image::normalizeImage(
-           fl::app::image::kImageNetMean, fl::app::image::kImageNetStd)});
+  ImageTransform valTransforms =
+      compose({// Resize shortest side to 256, then take a center crop
+               fl::ext::image::resizeTransform(randomResizeMin),
+               fl::ext::image::centerCropTransform(randomCropSize),
+               fl::ext::image::normalizeImage(mean, std)});
 
   const int64_t batchSizePerGpu = FLAGS_data_batch_size;
   const int64_t prefetchThreads = 10;
+  // const int64_t prefetchThreads = 1;
   const int64_t prefetchSize = FLAGS_data_batch_size;
+  LOG(INFO) << "labelPath=" << labelPath << std::endl;
   auto labelMap = getImagenetLabels(labelPath);
   auto trainDataset = fl::ext::image::DistributedDataset(
       imagenetDataset(trainList, labelMap, {trainTransforms}),
@@ -160,12 +167,13 @@ int main(int argc, char** argv) {
       prefetchSize,
       fl::BatchDatasetPolicy::SKIP_LAST);
 
+
   auto valDataset = fl::ext::image::DistributedDataset(
       imagenetDataset(valList, labelMap, {valTransforms}),
       worldRank,
       worldSize,
       batchSizePerGpu,
-      1, // train_n_repeatedaug
+      0, // train_n_repeatedaug
       prefetchThreads,
       prefetchSize,
       fl::BatchDatasetPolicy::INCLUDE_LAST);
@@ -176,11 +184,11 @@ int main(int argc, char** argv) {
   auto model = fl::ext::image::resnet34();
   // synchronize parameters of the model so that the parameters in each process
   // is the same
-  fl::allReduceParameters(model);
+  // fl::allReduceParameters(model);
 
   // Add a hook to synchronize gradients of model parameters as they are
   // computed
-  fl::distributeModuleGrads(model, reducer);
+  // fl::distributeModuleGrads(model, reducer);
 
   SGDOptimizer opt(
       model->params(), FLAGS_train_lr, FLAGS_train_momentum, FLAGS_train_wd);
@@ -219,7 +227,7 @@ int main(int argc, char** argv) {
   AverageValueMeter trainLossMeter;
   for (int epoch = (FLAGS_exp_checkpoint_epoch + 1); epoch < FLAGS_train_epochs;
        epoch++) {
-    trainDataset.resample(epoch);
+    trainDataset.resample();
     lrScheduler(epoch);
 
     // Get an iterator over the data
@@ -247,25 +255,32 @@ int main(int argc, char** argv) {
       loss.backward();
 
       if (FLAGS_distributed_enable) {
-        reducer->finalize();
+        // reducer->finalize();
       }
       opt.step();
 
       // Compute and record the prediction error.
       double trainLoss = trainLossMeter.value()[0];
-      if (++idx % 50 == 0) {
-        fl::ext::syncMeter(trainLossMeter);
-        fl::ext::syncMeter(timeMeter);
-        fl::ext::syncMeter(top5Acc);
-        fl::ext::syncMeter(top1Acc);
+      if (++idx % FLAGS_report_iters == 0) {
+        // fl::ext::syncMeter(trainLossMeter);
+        // fl::ext::syncMeter(timeMeter);
+        // fl::ext::syncMeter(top5Acc);
+        // fl::ext::syncMeter(top1Acc);
+      
         double time = timeMeter.value();
+        // std::cout << "idx=" << idx << " time=" << time << " --report_iters=" << FLAGS_report_iters 
+        //   << " --data_batch_size=" << FLAGS_data_batch_size << " idx/time=" << (idx/time) << " (idx/time)*batchsize="
+        //   << ((idx/time) * FLAGS_data_batch_size)
+        //   << std::endl;
         double samplePerSecond = (idx * FLAGS_data_batch_size) / time;
         FL_LOG_MASTER(INFO)
             << "Epoch " << epoch << std::setprecision(5) << " Batch: " << idx
             << " Samples per second " << samplePerSecond
             << ": Avg Train Loss: " << trainLoss
             << ": Train Top5 Accuracy( %): " << top5Acc.value()
-            << ": Train Top1 Accuracy( %): " << top1Acc.value();
+            << ": Train Top1 Accuracy( %): " << top1Acc.value() 
+            << " smaple num: " << idx * FLAGS_data_batch_size << " dataset size: "  << trainDataset.size()
+            << std::endl;
         top5Acc.reset();
         top1Acc.reset();
         trainLossMeter.reset();
@@ -280,8 +295,8 @@ int main(int argc, char** argv) {
     FL_LOG_MASTER(INFO) << "Epoch " << epoch << std::setprecision(5)
                         << " Validation Loss: " << valLoss
                         << " Validation Top5 Error (%): " << valTop5Err
-                        << " Validation Top1 Error (%): " << valTop1Error;
+                        << " Validation Top1 Error (%): " << valTop1Error << std::endl;
     saveModel(epoch);
   }
-  FL_LOG_MASTER(INFO) << "Training complete";
+  FL_LOG_MASTER(INFO) << "Training complete" << std::endl;
 }
