@@ -902,12 +902,22 @@ Variable categoricalCrossEntropy(
 
   int C = input.dims(0);
   int X = targets.elements();
+
   if (af::anyTrue<bool>(
           ((targets.array() < 0) || (targets.array() >= C)) &&
           (targets.array() != ignoreIndex))) {
+    bool b1 = af::anyTrue<bool>(targets.array() < 0);
+    bool b2 = af::anyTrue<bool>(targets.array() >= C);
+    bool b3 = af::anyTrue<bool>(targets.array() != ignoreIndex);
+
+    std::stringstream ss;
+    ss << "target contains elements out of valid range [0, num_categories) "
+        "in categorical cross entropy";
+    ss << " (targets.array() < 0)=" << b1
+     << " (targets.array() >= C)=" << b2 << " C=" << C
+     << " (targets.array() != ignoreIndex)=" << b3;
     throw std::invalid_argument(
-        "target contains elements out of valid range [0, num_categories) "
-        "in categorical cross entropy");
+        ss.str());
   }
 
   auto x = af::moddims(input.array(), af::dim4(C, X));

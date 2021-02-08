@@ -13,6 +13,13 @@ namespace fl {
 namespace ocl {
 std::unique_ptr<OpenClStream> OpenClStream::instance_;
 
+  DevicePtrOpenCl::~DevicePtrOpenCl() {
+    FL_OPENCL_CHECK(clFinish(getQueue() ));
+    af::sync();
+    arr_.unlock();
+    // delete ptr_;
+  }
+
 cl_context getContext() {
   return afcl::getContext();
 }

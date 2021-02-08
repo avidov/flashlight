@@ -8,6 +8,7 @@
 #include "flashlight/app/imgclass/dataset/Imagenet.h"
 
 #include <algorithm>
+#include <glog/logging.h>
 
 #include "flashlight/ext/image/af/Transforms.h"
 #include "flashlight/ext/image/fl/dataset/Jpeg.h"
@@ -62,6 +63,7 @@ std::shared_ptr<Dataset> imagenetDataset(
     std::string parentPath = s.substr(0, s.rfind("/"));
     std::string label = parentPath.substr(parentPath.rfind("/") + 1);
     if (labelMap.find(label) != labelMap.end()) {
+      // LOG(INFO) << "s=" << s << " lebel=" << labelMap.at(label);
       return labelMap.at(label);
     } else {
       throw std::runtime_error("Label: " + label + " not found in label map");

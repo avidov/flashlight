@@ -19,17 +19,54 @@
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
+#include <iostream>
 
-#include <CL/cl.h>
+// #include <CL/cl.h>
+#include <CL/cl.hpp>
 #include <af/opencl.h>
+#include <af/internal.h>
 
 #include "flashlight/fl/common/DevicePtr.h"
 
 #define FL_OPENCL_CHECK(err) \
   ::fl::ocl::detail::check(err, __FILE__, __LINE__, #err)
 
+using cl::Buffer;
+
 namespace fl {
 namespace ocl {
+
+
+class DevicePtrOpenCl {
+ public:
+  DevicePtrOpenCl(const af::array& in) {
+    if (in.isempty()) {
+              throw std::invalid_argument(
+            "DevicePtrOpenCl empty input");
+    } else {
+      if (!af::isLinear(in)) {
+        throw std::invalid_argument(
+            "can't get device pointer of non-contiguous array");
+      }
+      arr_ = in;
+      ptr_ = (cl_mem*) in.device<cl_mem>();
+    }
+  }  
+
+  ~DevicePtrOpenCl();
+
+ cl_mem* getAsClMem() const {
+    return ptr_;
+  }
+
+  cl_mem* get() const {
+    return ptr_;
+  }
+
+ private:
+  af::array arr_;
+  cl_mem* ptr_;
+};
 
 /**
  * A device pointer subclass for the OpenCL backend to handle cl_mem that
@@ -38,23 +75,23 @@ namespace ocl {
  *
  * Handles the cl_mem provided by ArrayFire that must be explicitly deleted.
  */
-class DevicePtrOpenCl : public fl::DevicePtr {
- public:
-  DevicePtrOpenCl(const af::array& in) : fl::DevicePtr(in) {
-    clMemBuf_ = in.device<cl_mem>();
-  }
+// class DevicePtrOpenCl : public fl::DevicePtr {
+//  public:
+//   DevicePtrOpenCl(const af::array& in) : fl::DevicePtr(in) {
+//     // clMemBuf_ = in.device<cl_mem>();
+//   }
 
-  ~DevicePtrOpenCl() {
-    delete clMemBuf_;
-  }
+//   ~DevicePtrOpenCl() {
+//     delete ptr_;
+//   }
 
-  cl_mem* getAsClMem() const {
-    return clMemBuf_;
-  }
+//   cl::Buffer* getAsClMem() const {
+//     return clMemBuf_;
+//   }
 
- private:
-  cl_mem* clMemBuf_;
-};
+//  private:
+//   cl::Buffer* clMemBuf_;
+// };
 
 /**
  * Gets the Arrayfire OpenCL context for the current device
