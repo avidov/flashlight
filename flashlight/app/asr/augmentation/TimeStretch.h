@@ -46,7 +46,6 @@ class TimeStretch : public SoundEffect {
  private:
   const TimeStretch::Config conf_;
   RandomNumberGenerator rng_;
-  std::unique_ptr<ListRandomizer<std::string>> listRandomizer_;
 };
 
 } // namespace sfx

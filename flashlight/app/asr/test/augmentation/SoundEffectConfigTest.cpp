@@ -66,17 +66,17 @@ TEST(SoundEffectConfigFile, ReadWriteJson) {
   sfxConf1[4].type_ = kNormalize;
   sfxConf1[4].normalizeOnlyIfTooHigh_ = false;
 
-  sfxConf1[5].type_ = kTimeStretch;
-  sfxConf1[5].timeStretchConfig_.proba_ = 1.0;
-  sfxConf1[5].timeStretchConfig_.factorMin_ = 0.8;
-  sfxConf1[5].timeStretchConfig_.factorMax_ = 1.5;
-  sfxConf1[5].timeStretchConfig_.window_ = 20.0;
-  sfxConf1[5].timeStretchConfig_.shift_ = 0.8;
-  sfxConf1[5].timeStretchConfig_.fading_ = 0.25;
-  sfxConf1[3].reverbEchoConfig_.sampleRate_ = 1600;
-  sfxConf1[3].reverbEchoConfig_.randomSeed_ = 77;
+  // sfxConf1[5].type_ = kTimeStretch;
+  // sfxConf1[5].timeStretchConfig_.proba_ = 1.0;
+  // sfxConf1[5].timeStretchConfig_.factorMin_ = 0.8;
+  // sfxConf1[5].timeStretchConfig_.factorMax_ = 1.5;
+  // sfxConf1[5].timeStretchConfig_.window_ = 20.0;
+  // sfxConf1[5].timeStretchConfig_.shift_ = 0.8;
+  // sfxConf1[5].timeStretchConfig_.fading_ = 0.25;
+  // sfxConf1[3].reverbEchoConfig_.sampleRate_ = 1600;
+  // sfxConf1[3].reverbEchoConfig_.randomSeed_ = 77;
 
-  writeSoundEffectConfigFile(configFile, sfxConf1);
+  writeSoundEffectConfigFile(configPath, sfxConf1);
   const std::vector<SoundEffectConfig> sfxConf2 =
       readSoundEffectConfigFile(configPath);
   EXPECT_EQ(sfxConf1.size(), sfxConf2.size());

@@ -9,10 +9,12 @@
 #include <gtest/gtest.h>
 
 #include <arrayfire.h>
-#include <assert.h>
 #include <sox.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <memory>
+
+#include <glog/logging.h>
 
 #include "flashlight/app/asr/augmentation/TimeStretch.h"
 #include "flashlight/app/asr/data/Sound.h"
@@ -26,9 +28,6 @@ using ::fl::lib::dirCreateRecursive;
 using ::fl::lib::getTmpPath;
 using ::fl::lib::pathsConcat;
 using ::testing::Pointwise;
-
-const char* inputFilename =
-    "/checkpoint/avidov/datasets/audio/LibriSpeech/train-other-500/1353/121397/1353-121397-0055.flac";
 
 namespace {
 // Arbitrary audioable signalSoxFmt values.
@@ -51,6 +50,539 @@ genSinWave(size_t numSamples, size_t freq, size_t sampleRate, float amplitude) {
 }
 
 } // namespace
+
+#define check(x)                                 \
+  {                                              \
+    if (!(x)) {                                  \
+      fprintf(stderr, "check failed: %s\n", #x); \
+      throw std::runtime_error(#x);              \
+    }                                            \
+  }
+
+const char* inputFilename =
+    "/checkpoint/avidov/datasets/audio/LibriSpeech/train-other-500/1353/121397/1353-121397-0055.flac";
+
+static sox_format_t *in, *out; /* input and output files */
+
+/* The function that will be called to input samples into the effects chain.
+ * In this example, we get samples to process from a SoX-openned audio file.
+ * In a different application, they might be generated or come from a different
+ * part of the application. */
+static int input_drain(sox_effect_t* effp, sox_sample_t* obuf, size_t* osamp) {
+  (void)effp; /* This parameter is not needed in this example */
+
+  /* ensure that *osamp is a multiple of the number of channels. */
+  *osamp -= *osamp % effp->out_signal.channels;
+
+  /* Read up to *osamp samples into obuf; store the actual number read
+   * back to *osamp */
+  *osamp = sox_read(in, obuf, *osamp);
+
+  /* sox_read may return a number that is less than was requested; only if
+   * 0 samples is returned does it indicate that end-of-file has been reached
+   * or an error has occurred */
+  if (!*osamp && in->sox_errno)
+    fprintf(stderr, "%s: %s\n", in->filename, in->sox_errstr);
+  return *osamp ? SOX_SUCCESS : SOX_EOF;
+}
+
+/* The function that will be called to output samples from the effects chain.
+ * In this example, we store the samples in a SoX-opened audio file.
+ * In a different application, they might perhaps be analysed in some way,
+ * or displayed as a wave-form */
+static int output_flow(
+    sox_effect_t* effp LSX_UNUSED,
+    sox_sample_t const* ibuf,
+    sox_sample_t* obuf LSX_UNUSED,
+    size_t* isamp,
+    size_t* osamp) {
+  /* Write out *isamp samples */
+  size_t len = sox_write(out, ibuf, *isamp);
+
+  /* len is the number of samples that were actually written out; if this is
+   * different to *isamp, then something has gone wrong--most often, it's
+   * out of disc space */
+  if (len != *isamp) {
+    fprintf(stderr, "%s: %s\n", out->filename, out->sox_errstr);
+    return SOX_EOF;
+  }
+
+  /* Outputting is the last `effect' in the effect chain so always passes
+   * 0 samples on to the next effect (as there isn't one!) */
+  *osamp = 0;
+
+  (void)effp; /* This parameter is not needed in this example */
+
+  return SOX_SUCCESS; /* All samples output successfully */
+}
+
+// struct SoxInputHandler {
+//   SoxInputHandler(const std::vector<float>& data)
+//       : data_(data),
+//         handler_{"input",
+//                  NULL,
+//                  SOX_EFF_MCHAN,
+//                  NULL,
+//                  NULL,
+//                  NULL,
+//                  inputDrain,
+//                  NULL,
+//                  NULL,
+//                  0} {}
+
+//   const std::vector<float>& data_;
+//   size_t dataIdx_ = 0;
+//   sox_effect_handler_t handler_;
+// };
+
+struct InputData {
+  std::vector<float>* data;
+  size_t index = 0;
+};
+
+int inputDrain(sox_effect_t* effp, sox_sample_t* obuf, size_t* osamp) {
+  auto h = (InputData*)effp->priv;
+  LOG(INFO) << "h=" << h << " h->data=" << h->data;
+
+  int i = 0;
+  for (; i < *osamp && h->index < h->data->size(); ++i, ++h->index) {
+    SOX_SAMPLE_LOCALS;
+    obuf[i] = SOX_FLOAT_32BIT_TO_SAMPLE(h->data->at(h->index), effp->clips);
+  }
+  *osamp = i;
+  return *osamp ? SOX_SUCCESS : SOX_EOF;
+}
+
+static sox_effect_handler_t const* input_handler(void) {
+  static sox_effect_handler_t handler = {"input",
+                                         NULL,
+                                         SOX_EFF_MCHAN,
+                                         NULL,
+                                         NULL,
+                                         NULL,
+                                         inputDrain,
+                                         NULL,
+                                         NULL,
+                                         sizeof(InputData)};
+  return &handler;
+}
+
+/* A `stub' effect handler to handle outputting samples from the effects
+ * chain; the only function needed for this example is `flow' */
+static sox_effect_handler_t const* output_handler(void) {
+  static sox_effect_handler_t handler = {"output",
+                                         NULL,
+                                         SOX_EFF_MCHAN,
+                                         NULL,
+                                         NULL,
+                                         output_flow,
+                                         NULL,
+                                         NULL,
+                                         NULL,
+                                         0};
+  return &handler;
+}
+
+TEST(TimeStretch, LibSoxExample1) {
+  const char* outputFilename = "/tmp/LibSoxExample1.flac";
+
+  sox_effects_chain_t* chain;
+  sox_effect_t* e;
+  const char* vol[] = {"3dB"};
+  char* args[10];
+
+  /* All libSoX applications must start by initialising the SoX library */
+  check(sox_init() == SOX_SUCCESS);
+
+  /* Open the input file (with default parameters) */
+  // check(in = sox_open_read(inputFilename, NULL, NULL, NULL));
+  auto data = loadSound<float>(inputFilename);
+
+  sox_encodinginfo_t encoding = {SOX_ENCODING_FLAC,
+                                 16,
+                                 0, // inf
+                                 sox_option_no,
+                                 sox_option_no,
+                                 sox_option_no,
+                                 sox_false};
+  sox_signalinfo_t signal = {sampleRate, 1, 16, data.size(), NULL};
+
+  /* Open the output file; we must specify the output signal characteristics.
+   * Since we are using only simple effects, they are the same as the input
+   * file characteristics */
+  check(out = sox_open_write(outputFilename, &signal, NULL, NULL, NULL, NULL));
+
+  /* Create an effects chain; some effects need to know about the input
+   * or output file encoding so we provide that information here */
+  chain = sox_create_effects_chain(&encoding, &encoding);
+
+  /* The first effect in the effect chain must be something that can source
+   * samples; in this case, we have defined an input handler that inputs
+   * data from an audio file */
+  e = sox_create_effect(input_handler());
+  // https://github.com/chirlu/sox/blob/dd8b63bdc2966c931b73d5f7a17db336cbec6c21/src/effects.c#L72
+  auto effectData = (InputData*)e->priv;
+  LOG(INFO) << "effectData=" << effectData << " &data=" << &data;
+  effectData->data = &data;
+  effectData->index = 0;
+  /* This becomes the first `effect' in the chain */
+  check(sox_add_effect(chain, e, &signal, &signal) == SOX_SUCCESS);
+
+  float factor = 2.5;
+  auto factorParam = std::to_string(factor);
+  e = sox_create_effect(sox_find_effect("stretch"));
+  args[0] = (char*)factorParam.c_str();
+  check(sox_effect_options(e, 1, args) == SOX_SUCCESS);
+  check(sox_add_effect(chain, e, &signal, &signal) == SOX_SUCCESS);
+  free(e);
+
+  /* Create the `vol' effect, and initialise it with the desired parameters: */
+  e = sox_create_effect(sox_find_effect("vol"));
+  check(sox_effect_options(e, 1, (char* const*)vol) == SOX_SUCCESS);
+  /* Add the effect to the end of the effects processing chain: */
+  check(sox_add_effect(chain, e, &signal, &signal) == SOX_SUCCESS);
+  free(e);
+
+  /* Create the `flanger' effect, and initialise it with default parameters: */
+  e = sox_create_effect(sox_find_effect("flanger"));
+  check(sox_effect_options(e, 0, NULL) == SOX_SUCCESS);
+  /* Add the effect to the end of the effects processing chain: */
+  check(sox_add_effect(chain, e, &signal, &signal) == SOX_SUCCESS);
+  free(e);
+
+  /* The last effect in the effect chain must be something that only consumes
+   * samples; in this case, we have defined an output handler that outputs
+   * data to an audio file */
+  e = sox_create_effect(output_handler());
+  check(sox_add_effect(chain, e, &signal, &signal) == SOX_SUCCESS);
+  free(e);
+
+  /* Flow samples through the effects processing chain until EOF is reached */
+  sox_flow_effects(chain, NULL, NULL);
+
+  /* All done; tidy up: */
+  sox_delete_effects_chain(chain);
+  sox_close(out);
+  sox_quit();
+}
+
+constexpr size_t MAX_SAMPLES = 2048;
+
+struct Sox {
+  Sox() {
+    check(sox_init() == SOX_SUCCESS);
+  }
+
+  ~Sox() {
+    sox_quit();
+  }
+
+  struct Buffer {
+    Buffer(sox_rate_t sampleRate, const std::vector<float>& data)
+        : signal{sampleRate, 1, 16, data.size(), NULL} {
+      sox_format_t* out = nullptr;
+      sox_sample_t samples[MAX_SAMPLES]; /* Temporary store whilst copying. */
+
+      check(
+          out = sox_open_memstream_write(
+              &buffer, &buffer_size, &signal, NULL, "sox", NULL));
+      // while ((number_read = sox_read(in, samples, MAX_SAMPLES))) {
+
+      int j = 0;
+      std::stringstream ss2;
+      std::stringstream ss3;
+      sox_uint64_t clips = 0;
+
+      for (int i = 0; i < data.size(); i++) {
+        SOX_SAMPLE_LOCALS;
+        samples[0] = SOX_FLOAT_32BIT_TO_SAMPLE(data[i], clips);
+        if (j < 100) {
+          ++j;
+          ss2 << samples[0] << ", ";
+          ss3 << data[i] << ", ";
+        }
+        check(sox_write(out, samples, 1) == 1);
+      }
+      sox_close(out);
+    }
+
+    ~Buffer() {
+      free(buffer);
+    }
+
+    char* buffer = nullptr;
+    size_t buffer_size = 0;
+
+    sox_encodinginfo_t encoding = {SOX_ENCODING_FLAC,
+                                   16,
+                                   0, // inf
+                                   sox_option_no,
+                                   sox_option_no,
+                                   sox_option_no,
+                                   sox_false};
+    sox_signalinfo_t signal;
+  };
+
+  std::unique_ptr<Sox::Buffer> toSoxBuffer(
+      size_t sampleRate,
+      const std::vector<float>& signal) {
+    return std::make_unique<Sox::Buffer>((sox_rate_t)sampleRate, signal);
+  }
+};
+
+TEST(TimeStretch, LibSoxLoadSound2) {
+  const char* outputFilename = "/tmp/LibSoxLoadSound2.flac";
+  auto signal = loadSound<float>(inputFilename);
+
+  Sox sox;
+  auto soxBuf = sox.toSoxBuffer(sampleRate, signal);
+  sox_format_t* in = nullptr;
+  sox_format_t* out = nullptr;
+
+  check(
+      in = sox_open_mem_read(
+          soxBuf->buffer, soxBuf->buffer_size, NULL, NULL, NULL));
+  check(
+      out = sox_open_write(
+          outputFilename,
+          &soxBuf->signal,
+          &soxBuf->encoding,
+          NULL,
+          NULL,
+          NULL));
+  sox_sample_t samples[MAX_SAMPLES];
+  int number_read = 0;
+  while ((number_read = sox_read(in, samples, MAX_SAMPLES))) {
+    std::stringstream ss;
+    for (int i = 0; i < 10; ++i) {
+      ss << samples[i] << ", ";
+    }
+    LOG(INFO) << " number_read=" << number_read << " samples=" << ss.str();
+    check(sox_write(out, samples, number_read) == number_read);
+  }
+  sox_close(out);
+  sox_close(in);
+}
+
+TEST(TimeStretch, LibSoxLoadSound3) {
+  const char* outputFilename = "/tmp/LibSoxLoadSound3.flac";
+  auto signal = loadSound<float>(inputFilename);
+  char* args[10];
+
+  Sox sox;
+  auto soxBuf = sox.toSoxBuffer(sampleRate, signal);
+  sox_format_t* in = nullptr;
+  sox_format_t* out = nullptr;
+
+  sox_effects_chain_t* chain;
+  sox_effect_t* e;
+  const char* vol[] = {"3dB"};
+
+  /* Open the output file; we must specify the output signal characteristics.
+   * Since we are using only simple effects, they are the same as the input
+   * file characteristics */
+  check(
+      out = sox_open_write(
+          outputFilename,
+          &soxBuf->signal,
+          &soxBuf->encoding,
+          NULL,
+          NULL,
+          NULL));
+
+  /* Create an effects chain; some effects need to know about the input
+   * or output file encoding so we provide that information here */
+  chain = sox_create_effects_chain(&soxBuf->encoding, &soxBuf->encoding);
+
+  check(
+      in = sox_open_mem_read(
+          soxBuf->buffer, soxBuf->buffer_size, NULL, NULL, NULL));
+
+  e = sox_create_effect(sox_find_effect("input"));
+  args[0] = (char*)in;
+  assert(sox_effect_options(e, 1, args) == SOX_SUCCESS);
+  /* This becomes the first `effect' in the chain */
+  assert(sox_add_effect(chain, e, &in->signal, &in->signal) == SOX_SUCCESS);
+  free(e);
+
+  /* Create the `vol' effect, and initialise it with the desired parameters: */
+  e = sox_create_effect(sox_find_effect("vol"));
+  check(sox_effect_options(e, 1, (char* const*)vol) == SOX_SUCCESS);
+  /* Add the effect to the end of the effects processing chain: */
+  check(
+      sox_add_effect(chain, e, &soxBuf->signal, &soxBuf->signal) ==
+      SOX_SUCCESS);
+  free(e);
+
+  /* Create the `flanger' effect, and initialise it with default parameters: */
+  e = sox_create_effect(sox_find_effect("flanger"));
+  check(sox_effect_options(e, 0, NULL) == SOX_SUCCESS);
+  /* Add the effect to the end of the effects processing chain: */
+  check(
+      sox_add_effect(chain, e, &soxBuf->signal, &soxBuf->signal) ==
+      SOX_SUCCESS);
+  free(e);
+
+  /* The last effect in the effect chain must be something that only consumes
+   * samples; in this case, we have defined an output handler that outputs
+   * data to an audio file */
+  e = sox_create_effect(output_handler());
+  check(
+      sox_add_effect(chain, e, &soxBuf->signal, &soxBuf->signal) ==
+      SOX_SUCCESS);
+  free(e);
+
+  /* Flow samples through the effects processing chain until EOF is reached */
+  sox_flow_effects(chain, NULL, NULL);
+
+  /* All done; tidy up: */
+  sox_delete_effects_chain(chain);
+  sox_close(out);
+  sox_close(in);
+  sox_quit();
+}
+
+TEST(TimeStretch, LibSoxLoadSound) {
+  const char* outputFilename = "/tmp/LibSoxLoadSound.flac";
+  auto signal = loadSound<float>(inputFilename);
+
+  sox_format_t *in, *out; /* input and output files */
+#define MAX_SAMPLES (size_t)2048
+  sox_sample_t samples[MAX_SAMPLES]; /* Temporary store whilst copying. */
+  char* buffer = nullptr;
+  size_t buffer_size = 0;
+  size_t number_read = 0;
+  size_t sum_read = 0;
+
+  sox_encodinginfo_t out_encoding = {SOX_ENCODING_FLAC,
+                                     16,
+                                     0, // inf
+                                     sox_option_no,
+                                     sox_option_no,
+                                     sox_option_no,
+                                     sox_false};
+  sox_signalinfo_t out_signal = {16000, 1, 16, signal.size(), NULL};
+
+  /* All libSoX applications must start by initialising the SoX library */
+  check(sox_init() == SOX_SUCCESS);
+
+  /* Open the input file (with default parameters) */
+  // check(in = sox_open_read(inputFilename, NULL, NULL, NULL));
+  check(
+      out = sox_open_memstream_write(
+          &buffer, &buffer_size, &out_signal, NULL, "sox", NULL));
+  // while ((number_read = sox_read(in, samples, MAX_SAMPLES))) {
+
+  int j = 0;
+  std::stringstream ss2;
+  std::stringstream ss3;
+  sox_uint64_t clips = 0;
+
+  for (int i = 0; i < signal.size(); i++) {
+    SOX_SAMPLE_LOCALS;
+    samples[0] = SOX_FLOAT_32BIT_TO_SAMPLE(signal[i], clips);
+    if (j < 100) {
+      ++j;
+      ss2 << samples[0] << ", ";
+      ss3 << signal[i] << ", ";
+    }
+    check(sox_write(out, samples, 1) == 1);
+  }
+  sox_close(out);
+
+  LOG(INFO) << "buffer=" << buffer << " buffer_size=" << buffer_size
+            << " number_read=" << number_read << " samples=" << ss2.str()
+            << "\nsignal=" << ss3.str();
+
+  check(in = sox_open_mem_read(buffer, buffer_size, NULL, NULL, NULL));
+  check(
+      out = sox_open_write(
+          outputFilename, &out_signal, &out_encoding, NULL, NULL, NULL));
+  while ((number_read = sox_read(in, samples, MAX_SAMPLES))) {
+    std::stringstream ss;
+    for (int i = 0; i < 10; ++i) {
+      ss << samples[i] << ", ";
+    }
+    LOG(INFO) << " number_read=" << number_read << " samples=" << ss.str();
+    check(sox_write(out, samples, number_read) == number_read);
+  }
+  sox_close(out);
+  sox_close(in);
+  free(buffer);
+
+  sox_quit();
+}
+
+TEST(TimeStretch, LibSoxNewMem) {
+  const char* outputFilename = "/tmp/LibSoxNewMem.flac";
+  auto signal = loadSound<float>(inputFilename);
+
+  static sox_format_t *in, *out; /* input and output files */
+#define MAX_SAMPLES (size_t)2048
+  sox_sample_t samples[MAX_SAMPLES]; /* Temporary store whilst copying. */
+  char* buffer = nullptr;
+  size_t buffer_size = 0;
+  size_t number_read = 0;
+  size_t sum_read = 0;
+
+  sox_sample_t samples2[MAX_SAMPLES]; /* Temporary store whilst copying. */
+
+  /* All libSoX applications must start by initialising the SoX library */
+  check(sox_init() == SOX_SUCCESS);
+
+  /* Open the input file (with default parameters) */
+  check(in = sox_open_read(inputFilename, NULL, NULL, NULL));
+  check(
+      out = sox_open_memstream_write(
+          &buffer, &buffer_size, &in->signal, NULL, "sox", NULL));
+  while ((number_read = sox_read(in, samples, MAX_SAMPLES))) {
+    sum_read += number_read;
+
+    static bool first = true;
+    if (first) {
+      first = false;
+      for (int i = 0; i < number_read; ++i) {
+        samples2[i] = samples[i];
+      }
+    }
+    check(sox_write(out, samples, number_read) == number_read);
+  }
+  std::cout << std::endl;
+  sox_close(out);
+  sox_close(in);
+
+  // LOG(INFO) << "buffer=" << (void*)buffer << " buffer_size=" << buffer_size
+  //           << " number_read=" << number_read << " sum_read=" << sum_read;
+
+  // for (int i = 0; i < MAX_SAMPLES; ++i) {
+  //   SOX_SAMPLE_LOCALS;
+  //   /* convert the sample from SoX's internal format to a `double' for
+  //    * processing in this application: */
+  //   double sample = SOX_SAMPLE_TO_FLOAT_64BIT(samples2[i], );
+  //   double sampleBuf = SOX_SAMPLE_TO_FLOAT_64BIT(((double*)buffer)[i], );
+
+  //   std::cout << "sample, sampleBuf, ==, signal, ==" << sample << ", "
+  //             << sampleBuf << ", " << (sample == sampleBuf) << " ," <<
+  //             signal[i]
+  //             << " ," << (sample == signal[i]) << std::endl;
+  // }
+
+  LOG(INFO) << "buffer=" << buffer << " buffer_size=" << buffer_size
+            << " number_read=" << number_read;
+
+  check(in = sox_open_mem_read(buffer, buffer_size, NULL, NULL, NULL));
+  check(
+      out =
+          sox_open_write(outputFilename, &in->signal, NULL, NULL, NULL, NULL));
+  while ((number_read = sox_read(in, samples, MAX_SAMPLES))) {
+    check(sox_write(out, samples, number_read) == number_read);
+  }
+  sox_close(out);
+  sox_close(in);
+  free(buffer);
+
+  sox_quit();
+}
 
 static void output_message(
     unsigned level,
@@ -160,10 +692,11 @@ sox_encodinginfo_t get_encodinginfo(
 
 /// helper classes for passing the location of input tensor and output buffer
 ///
-/// drain/flow callback functions require plaing C style function signature and
-/// the way to pass extra data is to attach data to sox_fffect_t::priv pointer.
-/// The following structs will be assigned to sox_fffect_t::priv pointer which
-/// gives sox_effect_t an access to input Tensor and output buffer object.
+/// drain/flow callback functions require plaing C style function signature
+/// and the way to pass extra data is to attach data to sox_fffect_t::priv
+/// pointer. The following structs will be assigned to sox_fffect_t::priv
+/// pointer which gives sox_effect_t an access to input Tensor and output
+/// buffer object.
 struct TensorInputPriv {
   size_t index;
   std::vector<float> signal;
@@ -176,7 +709,8 @@ struct FileOutputPriv {
 };
 
 // /// Callback function to feed Tensor data to SoxEffectChain.
-// int tensor_input_drain(sox_effect_t* effp, sox_sample_t* obuf, size_t* osamp)
+// int tensor_input_drain(sox_effect_t* effp, sox_sample_t* obuf, size_t*
+// osamp)
 // {
 //   // Retrieve the input Tensor and current index
 //   auto priv = static_cast<TensorInputPriv*>(effp->priv);
@@ -238,6 +772,32 @@ struct FileOutputPriv {
 //   }
 // }
 
+// template <typename T>
+// struct optional {
+//   std::unique_ptr<T> value;
+// };
+
+// std::tuple<int64_t, int64_t, int64_t, int64_t, std::string> get_info_file(
+//     const std::string& path,
+//     std::optional<std::string>& format) {
+//   SoxFormat sf(sox_open_read(
+//       path.c_str(),
+//       /*signal=*/nullptr,
+//       /*encoding=*/nullptr,
+//       /*filetype=*/format.has_value() ? format.value().c_str() : nullptr));
+
+//   if (static_cast<sox_format_t*>(sf) == nullptr) {
+//     throw std::runtime_error("Error opening audio file");
+//   }
+
+//   return std::make_tuple(
+//       static_cast<int64_t>(sf->signal.rate),
+//       static_cast<int64_t>(sf->signal.length / sf->signal.channels),
+//       static_cast<int64_t>(sf->signal.channels),
+//       static_cast<int64_t>(sf->encoding.bits_per_sample),
+//       get_encoding(sf->encoding.encoding));
+// }
+
 TEST(TimeStretch, LibSox) {
   auto signal = loadSound<float>(inputFilename);
   const std::string tmpDir = getTmpPath("TimeStretchSox");
@@ -251,13 +811,14 @@ TEST(TimeStretch, LibSox) {
   sox_signalinfo_t in_signal_info;
   in_signal_info.channels = 1;
   in_signal_info.length = signal.size();
-  in_signal_info.precision = get_precision("flac", af::dtype::s16);
+  in_signal_info.precision = 32; // get_precision("flac", af::dtype::s16);
   in_signal_info.rate = sampleRate;
   in_signal_info.mult = NULL;
 
   sox_encodinginfo_t in_encoding_info;
   in_encoding_info.bits_per_sample = 32;
-  in_encoding_info.encoding = get_encoding("flac", af::dtype::f16);
+  in_encoding_info.encoding =
+      SOX_ENCODING_FLOAT; // get_encoding("flac", af::dtype::f16);
   in_encoding_info.reverse_bytes = sox_option_no;
   in_encoding_info.reverse_bits = sox_option_no;
   in_encoding_info.opposite_endian = sox_false;
@@ -271,7 +832,7 @@ TEST(TimeStretch, LibSox) {
   char* args[10];
 
   /* All libSoX applications must start by initialising the SoX library */
-  assert(sox_init() == SOX_SUCCESS);
+  check(sox_init() == SOX_SUCCESS);
 
   std::vector<sox_sample_t> signalSoxFmt(signal.size());
   {
@@ -282,14 +843,14 @@ TEST(TimeStretch, LibSox) {
     }
   }
 
-  // assert(
-  //     in = sox_open_mem_read(
-  //         signalSoxFmt.data(),
-  //         signalSoxFmt.size(),
-  //         &in_signal_info,
-  //         &in_encoding_info,
-  //         "raw"));
-  assert(in = sox_open_read(inputFilename, NULL, NULL, NULL));
+  check(
+      in = sox_open_mem_read(
+          signalSoxFmt.data(),
+          signalSoxFmt.size(),
+          &in_signal_info,
+          &in_encoding_info,
+          "raw"));
+  // check(in = sox_open_read(inputFilename, NULL, NULL, NULL));
   // auto interm_signal = in->signalSoxFmt;
 
   std::stringstream ss;
@@ -297,40 +858,45 @@ TEST(TimeStretch, LibSox) {
   const std::string noiseFilePath = pathsConcat(tmpDir, ss.str());
   char* buffer = nullptr;
   size_t buffer_size = 0;
-  assert(
+  check(
       out = sox_open_memstream_write(
           &buffer, &buffer_size, &in_signal_info, NULL, "raw", NULL));
 
-  /* Create an effects chain; some effects need to know about the input
-   * or output file encoding so we provide that information here */
-  chain = sox_create_effects_chain(&in->encoding, &out->encoding);
+  // /* Create an effects chain; some effects need to know about the input
+  //  * or output file encoding so we provide that information here */
+  // chain = sox_create_effects_chain(&in->encoding, &out->encoding);
 
-  e = sox_create_effect(sox_find_effect("input"));
-  args[0] = (char*)in;
-  assert(sox_effect_options(e, 1, args) == SOX_SUCCESS);
-  assert(sox_add_effect(chain, e, &in_signal_info, &in->signal) == SOX_SUCCESS);
-  free(e);
-
-  // auto factorParam = std::to_string(factor);
-  // e = sox_create_effect(sox_find_effect("stretch"));
-  // args[0] = (char*)factorParam.c_str();
-  // assert(sox_effect_options(e, 1, args) == SOX_SUCCESS);
-  // assert(sox_add_effect(chain, e, &interm_signal, &interm_signal) ==
+  // e = sox_create_effect(sox_find_effect("input"));
+  // args[0] = (char*)in;
+  // check(sox_effect_options(e, 1, args) == SOX_SUCCESS);
+  // check(sox_add_effect(chain, e, &in_signal_info, &in->signal) ==
   // SOX_SUCCESS); free(e);
 
-  e = sox_create_effect(sox_find_effect("output"));
-  args[0] = (char*)out;
-  assert(sox_effect_options(e, 1, args) == SOX_SUCCESS);
-  assert(
-      sox_add_effect(chain, e, &in_signal_info, &out->signal) == SOX_SUCCESS);
-  free(e);
+  // // auto factorParam = std::to_string(factor);
+  // // e = sox_create_effect(sox_find_effect("stretch"));
+  // // args[0] = (char*)factorParam.c_str();
+  // // check(sox_effect_options(e, 1, args) == SOX_SUCCESS);
+  // // check(sox_add_effect(chain, e, &interm_signal, &interm_signal) ==
+  // // SOX_SUCCESS); free(e);
 
-  /* Flow samples through the effects processing chain until EOF is reached */
-  sox_flow_effects(chain, NULL, NULL);
-  // out->olength = 0; // workaround
+  // e = sox_create_effect(sox_find_effect("output"));
+  // args[0] = (char*)out;
+  // check(sox_effect_options(e, 1, args) == SOX_SUCCESS);
+  // check(sox_add_effect(chain, e, &in_signal_info, &out->signal) ==
+  // SOX_SUCCESS); free(e);
 
-  static const size_t maxSamples = 4096;
+  // /* Flow samples through the effects processing chain until EOF is reached
+  // */ sox_flow_effects(chain, NULL, NULL);
+  // // out->olength = 0; // workaround
+
+  static const size_t maxSamples = 2048;
   sox_sample_t samples[maxSamples];
+  size_t number_read;
+  while ((number_read = sox_read(in, samples, MAX_SAMPLES)))
+    check(sox_write(out, samples, number_read) == number_read);
+  sox_close(out);
+  sox_close(in);
+
   std::vector<sox_sample_t> augmentedSoxFmt;
   for (size_t r; 0 != (r = sox_read(out, samples, maxSamples));) {
     FL_LOG(fl::INFO) << "r=" << r;
@@ -369,9 +935,9 @@ TEST(TimeStretch, LibSox) {
   }
 
   /* All done; tidy up: */
-  sox_delete_effects_chain(chain);
-  sox_close(out);
-  sox_close(in);
+  // sox_delete_effects_chain(chain);
+  // sox_close(out);
+  // sox_close(in);
   free(buffer);
   sox_quit();
 }
@@ -420,5 +986,6 @@ TEST(TimeStretch, Basic) {
 
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
+  google::InitGoogleLogging(argv[0]);
   return RUN_ALL_TESTS();
 }

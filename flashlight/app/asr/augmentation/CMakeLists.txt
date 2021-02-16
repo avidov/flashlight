@@ -27,3 +27,5 @@ target_link_libraries(
   fl_asr_sfx_apply
   flashlight-app-asr
   )
+
+# include(${CMAKE_CURRENT_LIST_DIR}/sox/CMakeLists.txt)
