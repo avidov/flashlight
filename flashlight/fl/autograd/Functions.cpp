@@ -1201,6 +1201,7 @@ fl::Variable multiheadAttention(
   auto k = moddims(key, af::dim4(-1, headDim, nHeads * bsz));
   auto v = moddims(value, af::dim4(-1, headDim, nHeads * bsz));
 
+  q = q / std::sqrt(float(headDim));
   auto scores = matmulNT(q, k);
   if (!posEmb.isempty()) {
     int n = posEmb.dims(0) / 2 - offset;
@@ -1208,7 +1209,6 @@ fl::Variable multiheadAttention(
         relativePositionEmbeddingRotate(matmulNT(posEmb.as(q.type()), q));
     scores = scores + transpose(pscores.rows(n, n + k.dims(0) - 1));
   }
-  scores = scores / std::sqrt(float(headDim));
   if (!mask.isempty()) {
     scores = scores + tileAs(mask.as(scores.type()), scores);
   }
@@ -1230,5 +1230,87 @@ fl::Variable multiheadAttention(
   result = moddims(result, af::dim4(-1, headDim * nHeads, bsz));
   return result;
 }
+
+// void checkMH(fl::Variable out, std::string message) {
+//   if (af::anyTrue<bool>(af::isNaN(out.array()))) {
+//     auto p = af::sum<int>(af::flat(af::isNaN(out.array())));
+//     std::cerr << getWorldRank() << " Transformer NAN in " << message << " "
+//               << out.array().elements() << " | nan " << p << std::endl;
+//   }
+//   if (af::anyTrue<bool>(af::isInf(out.array()))) {
+//     auto m = af::isInf(out.array());
+//     auto p = af::sum<int>(af::flat(m));
+//     auto pos = af::sum<int>(af::flat(out.array()(m) > 0));
+//     auto neg = af::sum<int>(af::flat(out.array()(m) < 0));
+//     std::cerr << getWorldRank() << " Transformer Inf in " << message << " "
+//               << out.array().elements() << " | inf " << p << " | "
+//               << " pos inf " << pos << " neg inf " << neg << std::endl;
+//   }
+// }
+
+// fl::Variable multiheadAttention(
+//     const fl::Variable& query,
+//     const fl::Variable& key,
+//     const fl::Variable& value,
+//     const fl::Variable& posEmb,
+//     const fl::Variable& mask,
+//     const fl::Variable& padMask,
+//     const int32_t nHeads,
+//     const double pDropout,
+//     const int32_t offset /* = 0 */) {
+//   int32_t bsz = query.dims(2);
+//   int32_t modelDim = query.dims(1);
+//   int32_t headDim = modelDim / nHeads;
+
+//   auto q = moddims(query, af::dim4(-1, headDim, nHeads * bsz));
+//   auto k = moddims(key, af::dim4(-1, headDim, nHeads * bsz));
+//   auto v = moddims(value, af::dim4(-1, headDim, nHeads * bsz));
+
+//   q = q / std::sqrt(float(headDim));
+//   auto scores = matmulNT(q, k);
+//   checkMH(scores, "multiheadAttention scores");
+//   if (!posEmb.isempty()) {
+//     int n = posEmb.dims(0) / 2 - offset;
+//     auto pp = matmulNT(posEmb.as(q.type()), q);
+//     checkMH(pp, "multiheadAttention pos emb");
+//     auto pscores = relativePositionEmbeddingRotate(pp);
+//     scores = scores + transpose(pscores.rows(n, n + k.dims(0) - 1));
+//   }
+//   checkMH(scores, "multiheadAttention scores + pos emb");
+//   if (!mask.isempty()) {
+//     scores = scores + tileAs(mask.as(scores.type()), scores);
+//   }
+//   checkMH(scores, "multiheadAttention scores + pos emb + future mask");
+//   if (!padMask.isempty()) {
+//     if (padMask.dims(0) != query.dims(0)) {
+//       throw std::invalid_argument(
+//           "multiheadAttention: invalid padding mask size");
+//     }
+//     auto padMaskTile = moddims(padMask, af::dim4(1, padMask.dims(0), 1, bsz));
+//     padMaskTile = tileAs(
+//         padMaskTile, af::dim4(padMask.dims(0), padMask.dims(0), nHeads, bsz));
+//     scores = scores +
+//         moddims(padMaskTile.as(scores.type()),
+//                 af::dim4(padMask.dims(0), padMask.dims(0), nHeads * bsz));
+//   }
+//   checkMH(
+//       scores, "multiheadAttention scores + pos emb + future mask + pad mask");
+//   auto attn = dropout(softmax(scores, 1), pDropout);
+//   if (af::anyTrue<bool>(af::isNaN(attn.array()))) {
+//     auto m = af::isNaN(attn.array());
+//     std::cerr << "Attn nan " << m.dims() << std::endl; 
+//     af::print("attn nan from scores", scores.array()(m));
+//     af::print("attn sum of nan across axis", af::sum(m, 1));
+//   }
+//   checkMH(
+//       attn,
+//       "multiheadAttention scores + pos emb + future mask + pad mask + softmax");
+//   auto result = matmul(attn.as(v.type()), v);
+//   checkMH(
+//       result,
+//       "multiheadAttention scores + pos emb + future mask + pad mask + softmax + linear");
+//   result = moddims(result, af::dim4(-1, headDim * nHeads, bsz));
+//   return result;
+// }
 
 } // namespace fl

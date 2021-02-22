@@ -38,8 +38,57 @@ using fl::lib::join;
 using fl::lib::pathsConcat;
 
 using namespace fl::app::asr;
+/*
+af::array try1(const af::array& data1) {
+	  auto data = data1;
+	    int d0 = data.dims(0);
+	      int d1 = data.dims(1);
+	        int d2 = data.dims(2);
+		  int d3 = data.dims(3);
+		    data = af::join(0, data, af::constant(0.0, d1, d1, d2, d3, data.type()));
+		    af_print(data);
+		      data = af::moddims(data, af::dim4((d0 + d1) * d1, 1, d2, d3));
+af_print(data);
+		        data = data.rows(0, (d1 + d0 - 1) * d1 - 1);
+			  return af::moddims(data, af::dim4(d0 + d1 - 1, d1, d2, d3));
+}
 
+af::array try2(const af::array& data1) {
+	  auto data = data1;
+	    int d0 = data.dims(0);
+	      int d1 = data.dims(1);
+	        int d2 = data.dims(2);
+		  int d3 = data.dims(3);
+		    return af::join(0, data, af::constant(0.0, d1 - 1, d1, d2, d3, data.type()));
+}
+
+int trymy() {
+	  af::info();
+	    af::array input = af::randu(2, 3, 1, 1);
+	    auto var = fl::Variable(input, false);
+            int d0 = var.dims(0);
+	                  int d1 = var.dims(1);
+			                  int d2 = var.dims(2);
+					                    int d3 = var.dims(3);
+							std::vector<fl::Variable> v = {var, fl::Variable(af::constant(0.0, d1, d1, d2, d3, input.type()), false)};
+	    var = fl::concatenate(v, 0);
+	    var = fl::moddims(var,  af::dim4((d0 + d1) * d1, 1, d2, d3));
+	    var = var(af::range(af::dim4((d0 + d1 - 1) * d1)), af::span, af::span, af::span, true);
+	    var = fl::moddims(var, af::dim4(d0 + d1 - 1, d1, d2, d3));
+	    af::print("var", var.array());
+	    af_print(af::diag(input, -1, false));
+	      std::cout << try1(input).dims() << std::endl;
+	        std::cout << try2(input).dims() << std::endl;
+		af::print("inp", input);
+		af::print("1", try1(input));
+		af::print("2", try2(input));
+		  std::cout << fl::allClose(af::flat(try1(input)), af::flat(try2(input)))
+			              << std::endl;
+		    return 0;
+}
+*/
 int main(int argc, char** argv) {
+  //trymy(); return 0;
   fl::init();
   google::InitGoogleLogging(argv[0]);
   google::InstallFailureSignalHandler();

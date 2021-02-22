@@ -138,6 +138,9 @@ std::shared_ptr<fl::Dataset> DecodeMaster::forward(
     const std::shared_ptr<fl::Dataset>& ds) {
   auto emissionDataset = std::make_shared<fl::MemoryBlobDataset>();
   for (auto& batch : *ds) {
+    if (batch.empty()) {
+      continue;
+    }
     af::array output;
     if (usePlugin_) {
       output = net_->forward({fl::input(batch[kInputIdx]),

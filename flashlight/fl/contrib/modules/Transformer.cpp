@@ -130,18 +130,146 @@ std::vector<Variable> Transformer::forward(const std::vector<Variable>& input) {
         "Invalid inputs for transformer block: input and Mask batch sizes are different");
   }
 
-  float f = 1.0;
+  // float f = 1.0;
+  // if (train_ && (af::randu(1).scalar<float>() < pLayerdrop_)) {
+  //   f = 0.0;
+  // }
+  // if (preLN_) {
+  //   auto h = (f * (*norm1_)(selfAttention(input))).as(x.type()) + x;
+  //   return {f * (*norm2_)(mlp(h)).as(h.type()) + h};
+  // } else {
+  //   auto h = (*norm1_)((f * selfAttention(input)).as(x.type()) + x);
+  //   return {(*norm2_)((f * mlp(h)).as(h.type()) + h)};
+  // }
   if (train_ && (af::randu(1).scalar<float>() < pLayerdrop_)) {
-    f = 0.0;
+    if (preLN_) {
+      return {x};
+    } else {
+      return {(*norm2_)((*norm1_)(x))};
+    }  
   }
-  if (preLN_) {
-    auto h = (f * (*norm1_)(selfAttention(input))).as(x.type()) + x;
-    return {f * (*norm2_)(mlp(h)).as(h.type()) + h};
-  } else {
-    auto h = (*norm1_)((f * selfAttention(input)).as(x.type()) + x);
-    return {(*norm2_)((f * mlp(h)).as(h.type()) + h)};
+  else {
+    if (preLN_) {
+      auto h = ((*norm1_)(selfAttention(input))).as(x.type()) + x;
+      return {(*norm2_)(mlp(h)).as(h.type()) + h};
+    } else {
+      auto h = (*norm1_)((selfAttention(input)).as(x.type()) + x);
+      return {(*norm2_)((mlp(h)).as(h.type()) + h)};
+    }
   }
 }
+
+// void check(fl::Variable out, std::string message) {
+//   if (af::anyTrue<bool>(af::isNaN(out.array()))) {
+//     auto p = af::sum<int>(af::flat(af::isNaN(out.array())));
+//     std::cerr << getWorldRank() << " Transformer NAN in " << message << " "
+//               << out.array().elements() << " | nan " << p << std::endl;
+//   }
+//   if (af::anyTrue<bool>(af::isInf(out.array()))) {
+//     auto m = af::isInf(out.array());
+//     auto p = af::sum<int>(af::flat(m));
+//     auto pos = af::sum<int>(af::flat(out.array()(m) > 0));
+//     std::cerr << getWorldRank() << " Transformer Inf in " << message << " "
+//               << out.array().elements() << " | inf " << p << " | "
+//               << " pos inf " << pos << " neg inf " << p - pos << std::endl;
+//   }
+// }
+
+// Variable Transformer::selfAttention(const std::vector<Variable>& input) {
+//   // previous step[optionally], input, padMask
+//   auto encoderInput = input.at(input.size() - 2);
+//   // in case of previous state input[0] has size CxT_prevxB
+//   int n = input[0].dims(1), bsz = input[0].dims(2);
+//   double pDrop = train_ ? pDropout_ : 0.0;
+
+//   auto q = transpose((*wq_)(encoderInput));
+//   std::vector<fl::Variable> inputWithState(input.begin(), input.end() - 1);
+//   auto k = transpose((*wk_)(concatenate(inputWithState, 1)));
+//   auto v = transpose((*wv_)(concatenate(inputWithState, 1)));
+//   check(q, "self-attention q");
+//   check(k, "self-attention k");
+//   check(v, "self-attention v");
+
+//   Variable mask, posEmb;
+//   if (bptt_ > 0) {
+//     posEmb =
+//         tile(params_[0].as(encoderInput.type()), af::dim4(1, 1, nHeads_ * bsz));
+//     check(posEmb, "self-attention pos emb");
+//   }
+//   if (useMask_ && encoderInput.dims(1) > 1) {
+//     // mask future if we use the previous state (then n is previous time)
+//     mask = getMask(n, input.size() == 3);
+//   }
+
+//   int offset = (input.size() == 2) ? 0 : n;
+
+//   // time x batch
+//   fl::Variable padMask;
+//   if (!input.back().isempty()) {
+//     auto padMaskArr = input.back().array();
+//     padMaskArr =
+//         af::resize(padMaskArr, encoderInput.dims(1), encoderInput.dims(2));
+//     padMask = fl::Variable(af::log(padMaskArr), false);
+//     check(padMask, "self-attention pad mask");
+//   }
+//   auto result = multiheadAttention(
+//       q, k, v, posEmb, mask, padMask, nHeads_, pDrop, offset);
+//   check(result, "self-attention after multiheadAttention");
+//   result = (*wf_)(transpose(result));
+//   check(result, "self-attention after multiheadAttention + linear");
+//   return result;
+// }
+
+// std::vector<Variable> Transformer::forward(const std::vector<Variable>& input) {
+//   // previous step[optionally], input, padMask
+//   // padMask should be empty if previous step is provided
+//   // padMask is expected to have "1" on the used positions and "0" on padded
+//   // positions
+//   if (input.size() < 2) {
+//     throw std::invalid_argument(
+//         "Invalid inputs for transformer block: there should be at least input and mask");
+//   }
+//   auto x = input.at(input.size() - 2);
+//   if (!input.back().isempty() && x.dims(2) != input.back().dims(1)) {
+//     throw std::invalid_argument(
+//         "Invalid inputs for transformer block: input and Mask batch sizes are different");
+//   }
+
+//   float f = 1.0;
+//   if (train_ && (af::randu(1).scalar<float>() < pLayerdrop_)) {
+//     f = 0.0;
+//   }
+//   if (preLN_) {
+//     auto out = selfAttention(input);
+//     check(out, "self-attention");
+//     out = (*norm1_)(out);
+//     check(out, "self-attention + norm");
+//     auto h = (f * out).as(x.type()) + x;
+//     check(h, "self-attention + norm + drop + residual");
+//     out = mlp(h);
+//     check(out, "mlp");
+//     out = (*norm2_)(out).as(h.type());
+//     check(out, "mlp + norm");
+//     out = f * out + h;
+//     check(out, "mlp + norm + drop + residual");
+//     return {out};
+//   } else {
+//     auto out = (f * selfAttention(input)).as(x.type());
+//     check(out, "self-attention + drop");
+//     out = out + x;
+//     check(out, "self-attention + drop + residual");
+//     auto h = (*norm1_)(out);
+//     check(h, "self-attention + drop + residual + norm");
+//     out = (f * mlp(h)).as(h.type());
+//     check(out, "mlp + drop");
+//     out = out + h;
+//     check(out, "mlp + drop + residual");
+//     out = (*norm2_)(out);
+//     check(out, "mlp + drop + residual norm");
+//     return {out};
+//   }
+// }
+
 
 std::string Transformer::prettyString() const {
   std::ostringstream ss;

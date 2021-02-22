@@ -9,8 +9,8 @@
 
 namespace fl {
 
-double clipGradNorm(const std::vector<Variable>& parameters, double max_norm) {
-  double grad_norm = 0.0;
+double clipGradNorm(const std::vector<Variable>& parameters, double maxNorm) {
+  double gradNorm = 0.0;
   for (const auto& p : parameters) {
     if (!p.isGradAvailable()) {
       continue;
@@ -20,13 +20,23 @@ double clipGradNorm(const std::vector<Variable>& parameters, double max_norm) {
     // Only if gradients are fp16, compute the norm on grads that are cast to
     // f32. This cast can be removed when support for fp16 inputs is added.
     // https://github.com/arrayfire/arrayfire/blob/v3.7.1/src/api/c/norm.cpp#L128
-    grad_norm += std::pow(
-        af::norm(af::flat(
-            (grad.type() == af::dtype::f16 ? grad.as(af::dtype::f32) : grad))),
-        2);
+    gradNorm += af::sum<double>(grad * grad); 
+    // if (grad.type() == af::dtype::f16) {
+    //   float scaler = std::sqrt(grad.elements());
+    //   auto tmp = af::flat(grad) / scaler;
+    //   gradNorm +=
+    //       af::sum(tmp * tmp, 0).as(f32).scalar<float>() * scaler * scaler;
+    // } else {
+    //   gradNorm += std::pow(af::norm(af::flat(grad)), 2);
+    // }
+    // gradNorm += std::pow(
+    //     af::norm(af::flat(
+    //         (grad.type() == af::dtype::f16 ? grad.as(af::dtype::f32) :
+    //         grad))),
+    //     2);
   }
-  grad_norm = std::sqrt(grad_norm);
-  double scale = (max_norm / grad_norm);
+  gradNorm = std::sqrt(gradNorm);
+  double scale = (maxNorm / gradNorm);
   if (scale < 1.0) {
     for (auto& p : parameters) {
       if (!p.isGradAvailable()) {
@@ -37,7 +47,7 @@ double clipGradNorm(const std::vector<Variable>& parameters, double max_norm) {
       p.grad().array() = grad;
     }
   }
-  return grad_norm;
+  return gradNorm;
 }
 
 } // namespace fl

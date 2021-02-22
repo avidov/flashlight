@@ -60,6 +60,12 @@ class Transformer : public Container {
 
   std::vector<Variable> forward(const std::vector<Variable>& input) override;
   std::string prettyString() const override;
+  void setDropout(float value) {
+      pDropout_ = value;
+  }
+  void setLayerDropout(float value) {
+      pLayerdrop_ = value;
+  }
 
  private:
   int32_t nHeads_;
