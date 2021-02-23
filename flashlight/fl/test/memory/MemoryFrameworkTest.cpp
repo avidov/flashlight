@@ -118,6 +118,7 @@ class TestMemoryManager : public MemoryManagerAdapter {
   }
 
   void printInfo(const char* msg, const int device) override {}
+  void logStats(std::ostream* sink) override {}
 
   void userLock(const void* cPtr) override {
     void* ptr = const_cast<void*>(cPtr);
@@ -216,6 +217,9 @@ class MockTestMemoryManager : public TestMemoryManager {
         .WillByDefault(Invoke([this](const char* msg, const int device) {
           real_->printInfo(msg, device);
         }));
+    ON_CALL(*this, logStats(_))
+        .WillByDefault(
+            Invoke([this](std::ostream* sink) { real_->logStats(sink); }));
     ON_CALL(*this, userLock(_)).WillByDefault(Invoke([this](const void* cPtr) {
       real_->userLock(cPtr);
     }));
@@ -241,6 +245,7 @@ class MockTestMemoryManager : public TestMemoryManager {
   MOCK_METHOD2(unlock, void(void*, bool));
   MOCK_METHOD0(signalMemoryCleanup, void());
   MOCK_METHOD2(printInfo, void(const char*, const int));
+  MOCK_METHOD1(logStats, void(std::ostream*));
   MOCK_METHOD1(userLock, void(const void*));
   MOCK_METHOD1(userUnlock, void(const void*));
   MOCK_METHOD1(isUserLocked, bool(const void*));
@@ -400,19 +405,18 @@ TEST(MemoryFramework, AdapterInstallerDeviceInterfaceTest) {
   }
   // The custom memory is destroyed; check that the log stream, which is flushed
   // on destruction, contains the correct output
-  std::vector<std::string> expectedLinePrefixes = {
-      "initialize",
-      "nativeAlloc",
-      "alloc",
-      "nativeAlloc",
-      "alloc",
-      "unlock",
-      "unlock",
-      "signalMemoryCleanup",
-      "nativeFree",
-      "nativeFree",
-      "shutdown",
-      "shutdown"};
+  std::vector<std::string> expectedLinePrefixes = {"initialize",
+                                                   "nativeAlloc",
+                                                   "alloc",
+                                                   "nativeAlloc",
+                                                   "alloc",
+                                                   "unlock",
+                                                   "unlock",
+                                                   "signalMemoryCleanup",
+                                                   "nativeFree",
+                                                   "nativeFree",
+                                                   "shutdown",
+                                                   "shutdown"};
   size_t idx = 0;
   for (std::string line; std::getline(logStream, line);) {
     EXPECT_EQ(line.substr(0, line.find(" ")), expectedLinePrefixes[idx]);
