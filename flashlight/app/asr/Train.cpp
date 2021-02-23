@@ -588,6 +588,9 @@ int main(int argc, char** argv) {
   /* ===================== Logging ===================== */
   std::ofstream logFile;
   if (isMaster) {
+    LOG(INFO) << "runPath=" << runPath;
+    LOG(ERROR) << "logFile=" << getRunFile("log", runIdx, runPath);
+    fl::lib::dirCreateRecursive(runPath);
     fl::lib::dirCreate(runPath);
     logFile.open(getRunFile("log", runIdx, runPath));
     if (!logFile) {
