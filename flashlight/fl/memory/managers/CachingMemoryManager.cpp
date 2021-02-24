@@ -356,6 +356,11 @@ void CachingMemoryManager::mallocWithRetry(size_t size, void** ptr) {
   auto& memInfo = getDeviceMemoryInfo();
   try {
     ++memInfo.stats_.totalNativeMallocs_;
+    if (isMaster()) {
+      FL_LOG(fl::WARNING) << "before nativeAlloc(size=" << formatMemory(size)
+                          << ")";
+      logStats(&std::cerr);
+    }
     *ptr = this->deviceInterface->nativeAlloc(size);
   } catch (std::exception& exUnused) {
     try {
@@ -363,15 +368,18 @@ void CachingMemoryManager::mallocWithRetry(size_t size, void** ptr) {
       ++memInfo.stats_.totalNativeMallocs_;
       *ptr = this->deviceInterface->nativeAlloc(size);
     } catch (std::exception& ex) {
+      std::stringstream ss;
       // note: af exception inherits from std exception
-      std::cerr << "Failed to allocate memory of size " << formatMemory(size)
-                << " (Device: " << memInfo.deviceId_ << ", Capacity: "
-                << formatMemory(this->deviceInterface->getMaxMemorySize(
-                       memInfo.deviceId_))
-                << ", Allocated: "
-                << formatMemory(memInfo.stats_.allocatedBytes_)
-                << ", Cached: " << formatMemory(memInfo.stats_.cachedBytes_)
-                << ") with error '" << ex.what() << "'" << std::endl;
+      ss << "Failed to allocate memory of size " << size << "("
+         << formatMemory(size) << ") (Device: " << memInfo.deviceId_
+         << ", Capacity: "
+         << formatMemory(
+                this->deviceInterface->getMaxMemorySize(memInfo.deviceId_))
+         << ", Allocated: " << formatMemory(memInfo.stats_.allocatedBytes_)
+         << ", Cached: " << formatMemory(memInfo.stats_.cachedBytes_)
+         << ") with error '" << ex.what() << "'" << std::endl;
+      logStats(&ss);
+      std::cerr << ss.str() << std::endl;
       // note: converting here an af exception to std exception prevents to
       // catch the af error code at the user level. Rethrowing.
       throw;
@@ -410,6 +418,10 @@ void CachingMemoryManager::signalMemoryCleanup() {
   auto& memoryInfo = getDeviceMemoryInfo();
   std::lock_guard<std::recursive_mutex> lock(memoryInfo.mutexAll_);
 
+  std::stringstream ss;
+  ss << "before signalMemoryCleanup()" << std::endl;
+  logStats(&ss);
+
   freeBlocks(
       memoryInfo.largeBlocks_,
       memoryInfo.largeBlocks_.begin(),
@@ -419,6 +431,10 @@ void CachingMemoryManager::signalMemoryCleanup() {
       memoryInfo.smallBlocks_,
       memoryInfo.smallBlocks_.begin(),
       memoryInfo.smallBlocks_.end());
+
+  ss << "after signalMemoryCleanup()" << std::endl;
+  logStats(&ss);
+  std::cerr << ss.str();
 }
 
 float CachingMemoryManager::getMemoryPressure() {
@@ -466,17 +482,8 @@ void subtractBlock(
     }
     FL_LOG(fl::INFO) << "block_ [" << blockPtr << ','
                      << formatMemory(block->size_)
-                     << "] not found in cudaAvail=" << ss.str();
+                     << "] not found in cudaAvail=..."; // << ss.str();
   }
-}
-
-int bitmaskSize(size_t val) {
-  int cnt = 0;
-  while (val) {
-    ++cnt;
-    val >>= 1;
-  }
-  return cnt;
 }
 
 void CachingMemoryManager::printInfo(const char* msg, const int /* unused */) {
@@ -498,14 +505,20 @@ void CachingMemoryManager::logStats(std::ostream* sink /*=&std::cout*/) {
   auto& memInfo = getDeviceMemoryInfo();
   std::lock_guard<std::recursive_mutex> lock(memInfo.mutexAll_);
 
+  auto afDeviceId = af::getDevice();
+  if (memInfo.deviceId_ != afDeviceId) {
+    FL_LOG(ERROR) << " !!!!!! memInfo.deviceId_=" << memInfo.deviceId_
+                  << " afDeviceId=" << afDeviceId << " !!! ";
+  }
   const size_t capacity =
       this->deviceInterface->getMaxMemorySize(memInfo.deviceId_);
 
   size_t largestContiguousCache = 0;
   if (memInfo.stats_.gpuMemSize_ == 0) {
     memInfo.stats_.gpuMemSize_ = capacity;
+    // Mask off bits left of capacity.
     memInfo.stats_.gpuMemMask_ =
-        (1UL << bitmaskSize(memInfo.stats_.gpuMemSize_)) - 1;
+        ((1UL << (static_cast<size_t>(std::log2(capacity)) + 1)) - 1);
     FL_LOG(fl::INFO) << "memInfo.stats_.gpuMemSize_="
                      << formatMemory(memInfo.stats_.gpuMemSize_);
   }
@@ -516,6 +529,7 @@ void CachingMemoryManager::logStats(std::ostream* sink /*=&std::cout*/) {
       memInfo.stats_.totalNativeMallocsRecentLogging_) {
     memInfo.stats_.totalNativeMallocsRecentLogging_ =
         memInfo.stats_.totalNativeMallocs_;
+    memInfo.stats_.largestContiguousCuda_ = 0;
     recalcCudaFragmentation = true;
 
     cudaAvail[0] = memInfo.stats_.gpuMemSize_;
@@ -543,6 +557,20 @@ void CachingMemoryManager::logStats(std::ostream* sink /*=&std::cout*/) {
   }
 
   std::stringstream ss;
+  size_t free_byte = 0;
+  size_t total_byte = 0;
+  auto cuda_status = cudaMemGetInfo(&free_byte, &total_byte);
+  if (cudaSuccess != cuda_status) {
+    ss << "Error: cudaMemGetInfo fails wih error="
+       << cudaGetErrorString(cuda_status);
+  } else {
+    auto used_db = total_byte - free_byte;
+    ss << "GPU memory usage: used=" << used_db << " (" << formatMemory(used_db)
+       << ") free=" << free_byte << "(" << formatMemory(free_byte)
+       << ") total=" << total_byte << "(" << formatMemory(total_byte) << ")";
+  }
+  ss << std::endl;
+
   for (auto x : cudaAvail) {
     ss << ", " << formatMemory(x.second);
   };
@@ -555,7 +583,6 @@ void CachingMemoryManager::logStats(std::ostream* sink /*=&std::cout*/) {
         << "gpuMemSize: " << memInfo.stats_.gpuMemSize_ << ":"
         << formatMemory(memInfo.stats_.gpuMemSize_) << std::endl
         << "gpuMemMask: " << memInfo.stats_.gpuMemMask_ << std::endl
-        << "Device: " << memInfo.deviceId_ << std::endl
         << "Allocated: " << (memInfo.stats_.allocatedBytes_) << ":"
         << formatMemory(memInfo.stats_.allocatedBytes_) << std::endl
         << "Used: " << (memInfo.stats_.useAllocatedBytes_) << ":"
@@ -579,7 +606,11 @@ void CachingMemoryManager::logStats(std::ostream* sink /*=&std::cout*/) {
         << "Native Malloc Count: " << memInfo.stats_.totalNativeMallocs_
         << std::endl
         << "Native Free Cout: " << memInfo.stats_.totalNativeFrees_ << std::endl
-        << "Native-memory: " << ss.str() << std::endl;
+        << "Native-memory: " << ss.str() << std::endl
+        << "Device: " << memInfo.deviceId_ << ":" << afDeviceId << ":"
+        << ((memInfo.deviceId_ == afDeviceId) ? "ok" : "!!!mismatch!!")
+        << std::endl
+        << "rank: " << fl::getWorldRank() << std::endl;
   {
     *sink << "totalUseAllocatedBytesHist: ";
     for (int i = 0; i < kMaxAllocSize2Pwr; ++i) {

@@ -18,6 +18,8 @@
 #include <string>
 
 #include "flashlight/fl/memory/MemoryManagerDeviceInterface.h"
+#include "flashlight/fl/distributed/DistributedApi.h"
+#include "flashlight/fl/common/Logging.h"
 
 namespace fl {
 
@@ -136,6 +138,7 @@ class MemoryManagerAdapter {
   af_memory_manager getHandle() const;
 
   void configFromEnvironmentVariables();
+  static bool isMaster() { return fl::getWorldRank() == 0;};
 
   // Native and device memory management functions
   const std::shared_ptr<MemoryManagerDeviceInterface> deviceInterface;
@@ -155,7 +158,7 @@ class MemoryManagerAdapter {
 
 template <typename... Values>
 void MemoryManagerAdapter::log(std::string fname, Values... vs) {
-  if (loggingEnabled_ & (kLogStatsMask | kLogEveryOperationMask)) {
+  if (isMaster() && loggingEnabled_) {
     if (!logStream_) {
       throw std::runtime_error(
           "MemoryManagerAdapter::log: cannot write to logStream_"
@@ -175,7 +178,6 @@ void MemoryManagerAdapter::log(std::string fname, Values... vs) {
       }
       *logStream_ << logStreamBuffer_.str();
       logStream_->flush();
-      // std::cout <<  logStreamBuffer_.str();
       logStreamBuffer_.str(""); // empty the stream.
       logsSinceFlush_ = 0;
     }

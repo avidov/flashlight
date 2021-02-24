@@ -58,6 +58,11 @@ std::unique_ptr<std::ofstream> logFile;
 
 void MemoryManagerAdapter::configFromEnvironmentVariables() {
   const char* filename = std::getenv(kMemLogFile);
+   FL_LOG(fl::ERROR) << "Memory filename=" << filename;
+   FL_LOG(fl::ERROR) << "Memory getEnvAsBool(kMemLogStats, false)=" << getEnvAsBool(kMemLogStats, false);
+   if (!filename) {
+     filename ="/checkpoint/avidov/memory/train_new_nccl28/mem2.log";
+   }
   if (filename) {
     logFile = std::make_unique<std::ofstream>(filename);
     if (logFile && *logFile) {
@@ -92,11 +97,16 @@ MemoryManagerAdapter::MemoryManagerAdapter(
         "MemoryManagerAdapter::MemoryManagerAdapter - "
         "memory manager device interface is null");
   }
-  if (logStream_) {
-    loggingEnabled_ = true;
-  } else {
+  if (isMaster()) {
+    FL_LOG(fl::ERROR) << "MemoryManagerAdapter loggingEnabled_=" << loggingEnabled_;
     configFromEnvironmentVariables();
+    FL_LOG(fl::ERROR) << "MemoryManagerAdapter loggingEnabled_=" << loggingEnabled_;
   }
+  // if (logStream_) {
+  //   loggingEnabled_ = true;
+  // } else {
+  //   configFromEnvironmentVariables();
+  // }
 
   // Create handle and set payload to point to this instance
   AF_CHECK(af_create_memory_manager(&interface_));

@@ -116,7 +116,11 @@ class CachingMemoryManager : public MemoryManagerAdapter {
           curUseAllocatedBytesHist_(kMaxAllocSize2Pwr, 0),
           largestContiguousCuda_(0),
           gpuMemSize_(0),
-          gpuMemMask_(0) {}
+          gpuMemMask_(0) {
+            if (MemoryManagerAdapter::isMaster()) {
+              FL_LOG(fl::INFO) << "MemoryAllocationStats::MemoryAllocationStats()";
+            }
+          }
   };
 
   // Stores the mutex and misc variables per device so that we operate in a
