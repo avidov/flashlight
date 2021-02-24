@@ -147,8 +147,10 @@ CachingMemoryManager::CachingMemoryManager(
   splitSizeLimit_ = getEnvAsBytesFromFloatMb(kMemSplitSize, splitSizeLimit_);
 
   FL_LOG(fl::INFO) << "CachingMemoryManager recyclingSizeLimit_="
-                   << recyclingSizeLimit_
-                   << " splitSizeLimit_=" << splitSizeLimit_;
+                   << recyclingSizeLimit_ << " ("
+                   << formatMemory(recyclingSizeLimit_)
+                   << ") splitSizeLimit_=" << splitSizeLimit_ << " ("
+                   << formatMemory(splitSizeLimit_) << ")";
 
   for (int i = 0; i < numDevices; ++i) {
     deviceMemInfos_.emplace(
@@ -356,11 +358,6 @@ void CachingMemoryManager::mallocWithRetry(size_t size, void** ptr) {
   auto& memInfo = getDeviceMemoryInfo();
   try {
     ++memInfo.stats_.totalNativeMallocs_;
-    if (isMaster()) {
-      FL_LOG(fl::WARNING) << "before nativeAlloc(size=" << formatMemory(size)
-                          << ")";
-      logStats(&std::cerr);
-    }
     *ptr = this->deviceInterface->nativeAlloc(size);
   } catch (std::exception& exUnused) {
     try {
@@ -418,9 +415,9 @@ void CachingMemoryManager::signalMemoryCleanup() {
   auto& memoryInfo = getDeviceMemoryInfo();
   std::lock_guard<std::recursive_mutex> lock(memoryInfo.mutexAll_);
 
-  std::stringstream ss;
-  ss << "before signalMemoryCleanup()" << std::endl;
-  logStats(&ss);
+  if (isMaster()) {
+    printInfo("Before signalMemoryCleanup()");
+  }
 
   freeBlocks(
       memoryInfo.largeBlocks_,
@@ -432,9 +429,9 @@ void CachingMemoryManager::signalMemoryCleanup() {
       memoryInfo.smallBlocks_.begin(),
       memoryInfo.smallBlocks_.end());
 
-  ss << "after signalMemoryCleanup()" << std::endl;
-  logStats(&ss);
-  std::cerr << ss.str();
+  if (isMaster()) {
+    printInfo("After signalMemoryCleanup()");
+  }
 }
 
 float CachingMemoryManager::getMemoryPressure() {
@@ -443,47 +440,6 @@ float CachingMemoryManager::getMemoryPressure() {
 
 bool CachingMemoryManager::jitTreeExceedsMemoryPressure(size_t /* unused */) {
   return false; // TODO: check if this is optimal
-}
-
-void subtractBlock(
-    std::map<void*, size_t>& cudaAvail,
-    CachingMemoryManager::Block* block,
-    size_t mask) {
-  // cudaPointerAttributes attributes = {};
-  void* blockPtr = (void*)(mask & (size_t)block->ptr_);
-  // FL_CUDA_CHECK(cudaPointerGetAttributes(&attributes, block->ptr_));
-
-  auto itr = cudaAvail.lower_bound(blockPtr);
-  if (itr != cudaAvail.end()) {
-    --itr;
-    if (blockPtr == itr->first) {
-      long leftOverSize = itr->second - block->size_;
-      size_t newPtr = (size_t)blockPtr + block->size_;
-      cudaAvail[(void*)newPtr] = leftOverSize;
-      cudaAvail.erase(itr);
-    } else if (blockPtr > itr->first) {
-      size_t origSize = itr->second;
-      long leftOverSize =
-          (long)itr->first + itr->second - (long)blockPtr - block->size_;
-      itr->second = (size_t)blockPtr - (size_t)itr->first;
-      if (leftOverSize > 0) {
-        size_t newPTr = (size_t)blockPtr + block->size_;
-        cudaAvail[(void*)newPTr] = leftOverSize;
-      }
-    } else {
-      FL_LOG(fl::INFO) << "lblockPtr=" << blockPtr
-                       << " itr->first=" << itr->first
-                       << " block->ptr_=" << block->ptr_ << " mask=" << mask;
-    }
-  } else {
-    std::stringstream ss;
-    for (auto x : cudaAvail) {
-      ss << "[" << x.first << ',' << formatMemory(x.second) << "],";
-    }
-    FL_LOG(fl::INFO) << "block_ [" << blockPtr << ','
-                     << formatMemory(block->size_)
-                     << "] not found in cudaAvail=..."; // << ss.str();
-  }
 }
 
 void CachingMemoryManager::printInfo(const char* msg, const int /* unused */) {
@@ -501,58 +457,98 @@ void CachingMemoryManager::printInfo(const char* msg, const int /* unused */) {
             << std::endl;
 }
 
+namespace {
+
+// Subtract the given block from given memory map. This splits a block in the
+// exiting map.
+void subtractBlock(
+    std::map<void*, size_t>& nativeMemMap,
+    CachingMemoryManager::Block* block,
+    size_t mask) {
+  void* blockPtr = (void*)(mask & (size_t)block->ptr_);
+
+  auto itr = nativeMemMap.lower_bound(blockPtr);
+  if (itr != nativeMemMap.end()) {
+    --itr;
+    // If block happen to start right at the begining of a block at the memory
+    // map.
+    if (blockPtr == itr->first) {
+      long leftOverSize = itr->second - block->size_;
+      size_t newPtr = (size_t)blockPtr + block->size_;
+      nativeMemMap[(void*)newPtr] = leftOverSize;
+      nativeMemMap.erase(itr);
+    } else {
+      size_t origSize = itr->second;
+      long leftOverSize =
+          (long)itr->first + itr->second - (long)blockPtr - block->size_;
+      itr->second = (size_t)blockPtr - (size_t)itr->first;
+      if (leftOverSize > 0) {
+        size_t newPTr = (size_t)blockPtr + block->size_;
+        nativeMemMap[(void*)newPTr] = leftOverSize;
+      }
+    }
+  } else {
+    FL_LOG(fl::INFO) << "block_ [" << blockPtr << ','
+                     << formatMemory(block->size_)
+                     << "] not found in memory map";
+  }
+}
+
+void addMemSizeStat(std::ostream* sink, const std::string name, size_t size) {
+  *sink << name << ':' << size << ':' << formatMemory(size) << std::endl
+}
+
+} // namespace
+
 void CachingMemoryManager::logStats(std::ostream* sink /*=&std::cout*/) {
   auto& memInfo = getDeviceMemoryInfo();
   std::lock_guard<std::recursive_mutex> lock(memInfo.mutexAll_);
 
   auto afDeviceId = af::getDevice();
-  if (memInfo.deviceId_ != afDeviceId) {
-    FL_LOG(ERROR) << " !!!!!! memInfo.deviceId_=" << memInfo.deviceId_
-                  << " afDeviceId=" << afDeviceId << " !!! ";
-  }
-  const size_t capacity =
-      this->deviceInterface->getMaxMemorySize(memInfo.deviceId_);
 
   size_t largestContiguousCache = 0;
   if (memInfo.stats_.gpuMemSize_ == 0) {
+    const size_t capacity =
+        this->deviceInterface->getMaxMemorySize(memInfo.deviceId_);
     memInfo.stats_.gpuMemSize_ = capacity;
     // Mask off bits left of capacity.
     memInfo.stats_.gpuMemMask_ =
         ((1UL << (static_cast<size_t>(std::log2(capacity)) + 1)) - 1);
-    FL_LOG(fl::INFO) << "memInfo.stats_.gpuMemSize_="
-                     << formatMemory(memInfo.stats_.gpuMemSize_);
   }
-  std::map<void*, size_t> cudaAvail;
 
-  bool recalcCudaFragmentation = false;
+  std::map<void*, size_t> nativeMemMap;
+  bool refreshNativeMemMap = false;
   if (memInfo.stats_.totalNativeMallocs_ !=
       memInfo.stats_.totalNativeMallocsRecentLogging_) {
     memInfo.stats_.totalNativeMallocsRecentLogging_ =
         memInfo.stats_.totalNativeMallocs_;
-    memInfo.stats_.largestContiguousCuda_ = 0;
-    recalcCudaFragmentation = true;
+    memInfo.stats_.largestContiguousNative_ = 0;
+    refreshNativeMemMap = true;
 
-    cudaAvail[0] = memInfo.stats_.gpuMemSize_;
-    cudaAvail[(void*)(memInfo.stats_.gpuMemSize_ + 1)] = 0;
+    // Init native memory map with a single block the size of the entire native
+    // memory.
+    nativeMemMap[0] = memInfo.stats_.gpuMemSize_;
+    nativeMemMap[(void*)(memInfo.stats_.gpuMemSize_ + 1)] = 0;
   }
   for (auto& ptAndBlock : memInfo.allocatedBlocks_) {
-    if (recalcCudaFragmentation) {
-      subtractBlock(cudaAvail, ptAndBlock.second, memInfo.stats_.gpuMemMask_);
+    if (refreshNativeMemMap) {
+      subtractBlock(
+          nativeMemMap, ptAndBlock.second, memInfo.stats_.gpuMemMask_);
     }
   }
   for (auto block : memInfo.largeBlocks_) {
     largestContiguousCache = std::max(largestContiguousCache, block->size_);
-    if (recalcCudaFragmentation) {
-      subtractBlock(cudaAvail, block, memInfo.stats_.gpuMemMask_);
+    if (refreshNativeMemMap) {
+      subtractBlock(nativeMemMap, block, memInfo.stats_.gpuMemMask_);
     }
   }
-  if (recalcCudaFragmentation) {
+  if (refreshNativeMemMap) {
     for (auto block : memInfo.smallBlocks_) {
-      subtractBlock(cudaAvail, block, memInfo.stats_.gpuMemMask_);
+      subtractBlock(nativeMemMap, block, memInfo.stats_.gpuMemMask_);
     }
-    for (auto& cuBlock : cudaAvail) {
-      memInfo.stats_.largestContiguousCuda_ =
-          std::max(memInfo.stats_.largestContiguousCuda_, cuBlock.second);
+    for (auto& cuBlock : nativeMemMap) {
+      memInfo.stats_.largestContiguousNative_ =
+          std::max(memInfo.stats_.largestContiguousNative_, cuBlock.second);
     }
   }
 
@@ -571,48 +567,34 @@ void CachingMemoryManager::logStats(std::ostream* sink /*=&std::cout*/) {
   }
   ss << std::endl;
 
-  for (auto x : cudaAvail) {
-    ss << ", " << formatMemory(x.second);
-  };
   const size_t internalFragMem =
       (memInfo.stats_.allocatedBytes_ - memInfo.stats_.cachedBytes_ -
        memInfo.stats_.useAllocatedBytes_);
   const size_t largestContiguous =
-      std::max(memInfo.stats_.largestContiguousCuda_, largestContiguousCache);
-  *sink << "Type: CachingMemoryManager" << std::endl
-        << "gpuMemSize: " << memInfo.stats_.gpuMemSize_ << ":"
-        << formatMemory(memInfo.stats_.gpuMemSize_) << std::endl
-        << "gpuMemMask: " << memInfo.stats_.gpuMemMask_ << std::endl
-        << "Allocated: " << (memInfo.stats_.allocatedBytes_) << ":"
-        << formatMemory(memInfo.stats_.allocatedBytes_) << std::endl
-        << "Used: " << (memInfo.stats_.useAllocatedBytes_) << ":"
-        << formatMemory(memInfo.stats_.useAllocatedBytes_) << std::endl
-        << "Cached: " << (memInfo.stats_.cachedBytes_) << ":"
-        << formatMemory(memInfo.stats_.cachedBytes_) << std::endl
-        << "Internal Fragmentation: "
+      std::max(memInfo.stats_.largestContiguousNative_, largestContiguousCache);
+  addMemSizeStat(sink, "GpuMemSize", memInfo.stats_.gpuMemSize_);
+  addMemSizeStat(sink, "Allocated", memInfo.stats_.allocatedBytes_);
+  addMemSizeStat(sink, "Used", memInfo.stats_.useAllocatedBytes_);
+  addMemSizeStat(sink, "Cached", memInfo.stats_.cachedBytes_);
+  addMemSizeStat(sink, "LargestContiguousCache", largestContiguousCache);
+  addMemSizeStat(sink, "LargestContiguousNative", largestContiguousNative);
+  addMemSizeStat(sink, "LargestContiguous", largestContiguous);
+  *sink << "Internal Fragmentation: "
         << formatPercentOf(
                memInfo.stats_.useAllocatedBytes_,
                memInfo.stats_.allocatedBytes_ - memInfo.stats_.cachedBytes_)
         << std::endl
         << "internalFragMem: " << (internalFragMem) << ":"
         << formatMemory(internalFragMem) << std::endl
-        << "largestContiguousCache: " << largestContiguousCache << ":"
-        << formatMemory(largestContiguousCache) << std::endl
-        << "largestContiguousCuda: " << memInfo.stats_.largestContiguousCuda_
-        << ":" << formatMemory(memInfo.stats_.largestContiguousCuda_)
-        << std::endl
-        << "largestContiguous: " << largestContiguous << ":"
         << formatMemory(largestContiguous) << std::endl
-        << "Native Malloc Count: " << memInfo.stats_.totalNativeMallocs_
+        << "NativeMallocCount:" << memInfo.stats_.totalNativeMallocs_
         << std::endl
-        << "Native Free Cout: " << memInfo.stats_.totalNativeFrees_ << std::endl
-        << "Native-memory: " << ss.str() << std::endl
-        << "Device: " << memInfo.deviceId_ << ":" << afDeviceId << ":"
-        << ((memInfo.deviceId_ == afDeviceId) ? "ok" : "!!!mismatch!!")
-        << std::endl
-        << "rank: " << fl::getWorldRank() << std::endl;
+        << "NativeFreeCout:" << memInfo.stats_.totalNativeFrees_ << std::endl
+        << "Device:" << memInfo.deviceId_ << std::endl
+        << "Rank: " << fl::getWorldRank() << std::endl;
+
   {
-    *sink << "totalUseAllocatedBytesHist: ";
+    *sink << "TotalUseAllocatedBytesHist:";
     for (int i = 0; i < kMaxAllocSize2Pwr; ++i) {
       *sink << memInfo.stats_.totalUseAllocatedBytesHist_[i];
       if (i < kMaxAllocSize2Pwr - 1) {
@@ -623,7 +605,7 @@ void CachingMemoryManager::logStats(std::ostream* sink /*=&std::cout*/) {
   }
 
   {
-    *sink << "curUseAllocatedBytesHist__: ";
+    *sink << "CurUseAllocatedBytesHist: ";
     for (int i = 0; i < kMaxAllocSize2Pwr; ++i) {
       *sink << memInfo.stats_.curUseAllocatedBytesHist_[i];
       if (i < kMaxAllocSize2Pwr - 1) {
