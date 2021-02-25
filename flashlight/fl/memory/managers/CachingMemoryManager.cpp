@@ -168,6 +168,14 @@ void CachingMemoryManager::setSplitSizeLimit(size_t limit) {
   splitSizeLimit_ = limit;
 }
 
+void CachingMemoryManager::setRunPhase(RunPhase runPhase) {
+  auto& memoryInfo = getDeviceMemoryInfo();
+  std::lock_guard<std::recursive_mutex> lock(memoryInfo.mutexAll_);
+  for (auto& devAndInfo : deviceMemInfos_) {
+    devAndInfo.second->stats_.runPhase_ = runPhase;
+  }
+}
+
 void CachingMemoryManager::shutdown() {
   signalMemoryCleanup();
 }
@@ -416,7 +424,7 @@ void CachingMemoryManager::signalMemoryCleanup() {
   std::lock_guard<std::recursive_mutex> lock(memoryInfo.mutexAll_);
 
   if (isMaster()) {
-    printInfo("Before signalMemoryCleanup()");
+    printInfo("Before signalMemoryCleanup()", memoryInfo.deviceId_);
   }
 
   freeBlocks(
@@ -430,7 +438,7 @@ void CachingMemoryManager::signalMemoryCleanup() {
       memoryInfo.smallBlocks_.end());
 
   if (isMaster()) {
-    printInfo("After signalMemoryCleanup()");
+    printInfo("After signalMemoryCleanup()", memoryInfo.deviceId_);
   }
 }
 
@@ -495,7 +503,7 @@ void subtractBlock(
 }
 
 void addMemSizeStat(std::ostream* sink, const std::string name, size_t size) {
-  *sink << name << ':' << size << ':' << formatMemory(size) << std::endl
+  *sink << name << ':' << size << ':' << formatMemory(size) << std::endl;
 }
 
 } // namespace
@@ -552,43 +560,42 @@ void CachingMemoryManager::logStats(std::ostream* sink /*=&std::cout*/) {
     }
   }
 
-  std::stringstream ss;
-  size_t free_byte = 0;
-  size_t total_byte = 0;
-  auto cuda_status = cudaMemGetInfo(&free_byte, &total_byte);
-  if (cudaSuccess != cuda_status) {
-    ss << "Error: cudaMemGetInfo fails wih error="
-       << cudaGetErrorString(cuda_status);
-  } else {
-    auto used_db = total_byte - free_byte;
-    ss << "GPU memory usage: used=" << used_db << " (" << formatMemory(used_db)
-       << ") free=" << free_byte << "(" << formatMemory(free_byte)
-       << ") total=" << total_byte << "(" << formatMemory(total_byte) << ")";
-  }
-  ss << std::endl;
-
   const size_t internalFragMem =
       (memInfo.stats_.allocatedBytes_ - memInfo.stats_.cachedBytes_ -
        memInfo.stats_.useAllocatedBytes_);
-  const size_t largestContiguous =
-      std::max(memInfo.stats_.largestContiguousNative_, largestContiguousCache);
+
   addMemSizeStat(sink, "GpuMemSize", memInfo.stats_.gpuMemSize_);
   addMemSizeStat(sink, "Allocated", memInfo.stats_.allocatedBytes_);
   addMemSizeStat(sink, "Used", memInfo.stats_.useAllocatedBytes_);
   addMemSizeStat(sink, "Cached", memInfo.stats_.cachedBytes_);
   addMemSizeStat(sink, "LargestContiguousCache", largestContiguousCache);
-  addMemSizeStat(sink, "LargestContiguousNative", largestContiguousNative);
-  addMemSizeStat(sink, "LargestContiguous", largestContiguous);
-  *sink << "Internal Fragmentation: "
+  addMemSizeStat(
+      sink, "LargestContiguousNative", memInfo.stats_.largestContiguousNative_);
+  addMemSizeStat(sink, "RecyclingSizeLimit", recyclingSizeLimit_);
+  addMemSizeStat(sink, "SplitSizeLimit", splitSizeLimit_);
+  addMemSizeStat(sink, "InternalFragMem", internalFragMem);
+
+  std::stringstream ss;
+  size_t cudaFree = 0;
+  size_t cudaTotal = 0;
+  auto cuda_status = cudaMemGetInfo(&cudaFree, &cudaTotal);
+  if (cudaSuccess != cuda_status) {
+    *sink << "Error: cudaMemGetInfo fails wih error="
+          << cudaGetErrorString(cuda_status) << std::endl;
+  }
+  auto cudaUsed = cudaTotal - cudaFree;
+  addMemSizeStat(sink, "CudaUsed", cudaUsed);
+  addMemSizeStat(sink, "CudaFree", cudaFree);
+  addMemSizeStat(sink, "CudaTotal", cudaTotal);
+
+  *sink << "InternalFragmentation:"
         << formatPercentOf(
                memInfo.stats_.useAllocatedBytes_,
                memInfo.stats_.allocatedBytes_ - memInfo.stats_.cachedBytes_)
         << std::endl
-        << "internalFragMem: " << (internalFragMem) << ":"
-        << formatMemory(internalFragMem) << std::endl
-        << formatMemory(largestContiguous) << std::endl
         << "NativeMallocCount:" << memInfo.stats_.totalNativeMallocs_
         << std::endl
+        << "RunPhase:" << memInfo.stats_.runPhase_ << std::endl
         << "NativeFreeCout:" << memInfo.stats_.totalNativeFrees_ << std::endl
         << "Device:" << memInfo.deviceId_ << std::endl
         << "Rank: " << fl::getWorldRank() << std::endl;

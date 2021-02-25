@@ -57,6 +57,8 @@ class CachingMemoryManager : public MemoryManagerAdapter {
   // thread safe
   void setRecyclingSizeLimit(size_t);
   void setSplitSizeLimit(size_t);
+  enum RunPhase { kUnknown, kTrain, kEval, kBackward, kForward, kReduce,  kValidation};
+  void setRunPhase(RunPhase runPhase);
 
   // Block denotes a single allocated unit of memory.
   struct Block {
@@ -101,9 +103,10 @@ class CachingMemoryManager : public MemoryManagerAdapter {
     std::unordered_map<void*, size_t> nativeAllocated_;
     std::vector<size_t> totalUseAllocatedBytesHist_;
     std::vector<size_t> curUseAllocatedBytesHist_;
-    size_t largestContiguousCuda_;
+    size_t largestContiguousNative_;
     size_t gpuMemSize_;
     size_t gpuMemMask_;
+    RunPhase runPhase_;
 
     MemoryAllocationStats()
         : totalNativeMallocs_(0),
@@ -114,13 +117,10 @@ class CachingMemoryManager : public MemoryManagerAdapter {
           useAllocatedBytes_(0),
           totalUseAllocatedBytesHist_(kMaxAllocSize2Pwr, 0),
           curUseAllocatedBytesHist_(kMaxAllocSize2Pwr, 0),
-          largestContiguousCuda_(0),
+          largestContiguousNative_(0),
           gpuMemSize_(0),
-          gpuMemMask_(0) {
-            if (MemoryManagerAdapter::isMaster()) {
-              FL_LOG(fl::INFO) << "MemoryAllocationStats::MemoryAllocationStats()";
-            }
-          }
+          gpuMemMask_(0),
+          runPhase_(kUnknown) {}
   };
 
   // Stores the mutex and misc variables per device so that we operate in a

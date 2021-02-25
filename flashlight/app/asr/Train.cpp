@@ -32,6 +32,7 @@
 #include "flashlight/ext/plugin/ModulePlugin.h"
 #include "flashlight/fl/contrib/contrib.h"
 #include "flashlight/fl/flashlight.h"
+#include "flashlight/fl/memory/managers/CachingMemoryManager.h"
 #include "flashlight/lib/common/System.h"
 #include "flashlight/lib/text/decoder/lm/KenLM.h"
 #include "flashlight/lib/text/dictionary/Dictionary.h"
@@ -89,6 +90,15 @@ DEFINE_double(
     "probability to update fixed cache");
 DEFINE_double(slimIPL_dyn_dropout, -1, "dyn dropout to set at slimIPL_start");
 } // namespace
+
+void markPhase(fl::CachingMemoryManager::RunPhase phase) {
+  auto* curMemMgr =
+      fl::MemoryManagerInstaller::currentlyInstalledMemoryManager();
+  if (curMemMgr) {
+    auto* cacheMgr = dynamic_cast<fl::CachingMemoryManager*>(curMemMgr);
+    cacheMgr->setRunPhase(phase);
+  }
+}
 
 int main(int argc, char** argv) {
   fl::init();
@@ -650,22 +660,6 @@ int main(int argc, char** argv) {
         }
       };
 
-  std::ofstream memLog;
-  if (FLAGS_fl_log_mem_ops_interval > 0 && isMaster) {
-    auto* curMemMgr =
-        fl::MemoryManagerInstaller::currentlyInstalledMemoryManager();
-    if (curMemMgr) {
-      memLog.open(getRunFile("mem", runIdx, runPath));
-      if (!memLog) {
-        LOG(FATAL) << "failed to open memory log file="
-                   << getRunFile("mem", runIdx, runPath) << " for writing";
-      }
-      curMemMgr->setLogStream(&memLog);
-      curMemMgr->setLoggingEnabled(true);
-      curMemMgr->setLogFlushInterval(FLAGS_fl_log_mem_ops_interval);
-    }
-  }
-
   auto saveModels = [&](int iter, int totalUpdates) {
     if (FLAGS_slimIPL_type == "pre-cache" || FLAGS_slimIPL_type == "cache" ||
         FLAGS_slimIPL_type == "fixed-pre-cache") {
@@ -766,6 +760,8 @@ int main(int argc, char** argv) {
                         const af::array& target,
                         const af::array& inputSizes,
                         DatasetMeters& mtr) {
+    markPhase(fl::CachingMemoryManager::RunPhase::kEval);
+
     auto batchsz = op.dims(2);
     for (int b = 0; b < batchsz; ++b) {
       auto tgt = target(af::span, b);
@@ -940,6 +936,8 @@ int main(int argc, char** argv) {
     //   fl::distributeModuleGrads(crit, reducer);
     // }
 
+    markPhase(fl::CachingMemoryManager::RunPhase::kTrain);
+
     meters.train.loss.reset();
     meters.trainUnsup.loss.reset();
     meters.train.tknEdit.reset();
@@ -989,6 +987,8 @@ int main(int argc, char** argv) {
                                   int64_t totalUpdates,
                                   double lr,
                                   double lrcrit) {
+      markPhase(fl::CachingMemoryManager::RunPhase::kValidation);
+
       meters.runtime.stop();
       meters.timer.stop();
       meters.sampletimer.stop();
@@ -1448,6 +1448,8 @@ int main(int argc, char** argv) {
             }
           }
 
+          markPhase(fl::CachingMemoryManager::RunPhase::kBackward);
+
           // backward
           meters.bwdtimer.resume();
           netopt->zeroGrad();
@@ -1470,6 +1472,8 @@ int main(int argc, char** argv) {
           }
           af::sync();
           meters.bwdtimer.stopAndIncUnit();
+
+          markPhase(fl::CachingMemoryManager::RunPhase::kTrain);
 
           // optimizer
           meters.optimtimer.resume();
