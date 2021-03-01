@@ -8,7 +8,10 @@
 #include <array>
 #include <thread>
 
+#include <iostream>
 #include "flashlight/fl/dataset/BlobDataset.h"
+#include "flashlight/fl/flashlight.h"
+#include "flashlight/fl/memory/managers/CachingMemoryManager.h"
 
 namespace fl {
 
@@ -16,6 +19,22 @@ const int64_t magicNumber = 0x31626f6c423a6c66;
 
 BlobDatasetEntryBuffer::BlobDatasetEntryBuffer() {}
 
+namespace {
+void logMemStats(const char* file, int line) {
+  if (fl::getWorldRank() == 0) {
+    std::stringstream ss;
+    ss << file << ":" << line << " logMemStats():" << std::endl;
+    auto* curMemMgr =
+        fl::MemoryManagerInstaller::currentlyInstalledMemoryManager();
+    if (curMemMgr) {
+      curMemMgr->logStats(&ss);
+    }
+    std::cerr << ss.str();
+  }
+}
+
+#define LOG_MEM_STATS() logMemStats(__FILE__, __LINE__)
+} // namespace
 void BlobDatasetEntryBuffer::clear() {
   data_.clear();
 }
@@ -30,11 +49,15 @@ void BlobDatasetEntryBuffer::resize(int64_t size) {
 
 BlobDatasetEntry BlobDatasetEntryBuffer::get(const int64_t idx) const {
   BlobDatasetEntry e;
-  e.type = static_cast<af::dtype>(data_[idx * nFieldPerEntry_]);
+  // LOG_MEM_STATS();
+  e.type = static_cast<af::dtype>(data_.at(idx * nFieldPerEntry_));
   for (int i = 0; i < 4; i++) {
-    e.dims[i] = data_[idx * nFieldPerEntry_ + i + 1];
+    // LOG_MEM_STATS();
+    e.dims[i] = data_.at(idx * nFieldPerEntry_ + i + 1);
   }
-  e.offset = data_[idx * nFieldPerEntry_ + 5];
+  // LOG_MEM_STATS();
+  e.offset = data_.at(idx * nFieldPerEntry_ + 5);
+  LOG_MEM_STATS();
   return e;
 }
 
@@ -63,24 +86,29 @@ int64_t BlobDataset::size() const {
 std::vector<af::array> BlobDataset::get(const int64_t idx) const {
   std::vector<af::array> sample;
   for (int64_t i = 0; i < sizes_.at(idx); i++) {
+    // LOG_MEM_STATS();
     auto entry = entries_.get(offsets_.at(idx) + i);
     sample.push_back(readArray(entry, i));
   }
+  LOG_MEM_STATS();
   return sample;
 };
 
 std::vector<std::vector<uint8_t>> BlobDataset::rawGet(const int64_t idx) const {
   std::vector<std::vector<uint8_t>> sample;
   for (int64_t i = 0; i < sizes_.at(idx); i++) {
+    // LOG_MEM_STATS();
     auto entry = entries_.get(offsets_.at(idx) + i);
     sample.push_back(readRawArray(entry));
   }
+  LOG_MEM_STATS();
   return sample;
 };
 
 void BlobDataset::add(const std::vector<af::array>& sample) {
   int64_t entryOffset;
   {
+    LOG_MEM_STATS();
     std::lock_guard<std::mutex> lock(mutex_);
     entryOffset = entries_.size();
     offsets_.push_back(entries_.size());

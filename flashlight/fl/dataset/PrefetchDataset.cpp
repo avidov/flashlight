@@ -8,11 +8,31 @@
 #include <memory>
 #include <stdexcept>
 
+#include "flashlight/fl/common/Logging.h"
 #include "flashlight/fl/common/Serialization.h"
 #include "flashlight/fl/dataset/PrefetchDataset.h"
+#include "flashlight/fl/distributed/DistributedApi.h"
+#include "flashlight/fl/flashlight.h"
+#include "flashlight/fl/memory/managers/CachingMemoryManager.h"
 
 namespace fl {
+namespace {
+void logMemStats(const char* file, int line) {
+  if (fl::getWorldRank() == 0) {
+    std::stringstream ss;
+    ss << file << ":" << line << " logMemStats():" << std::endl;
+    auto* curMemMgr =
+        fl::MemoryManagerInstaller::currentlyInstalledMemoryManager();
+    if (curMemMgr) {
+      curMemMgr->logStats(&ss);
+    }
+    std::cerr << ss.str();
+  }
+}
 
+#define LOG_MEM_STATS() logMemStats(__FILE__, __LINE__)
+
+} // namespace
 PrefetchDataset::PrefetchDataset(
     std::shared_ptr<const Dataset> dataset,
     int64_t numThreads,
@@ -30,6 +50,10 @@ PrefetchDataset::PrefetchDataset(
   }
   if (numThreads_ > 0) {
     auto deviceId = af::getDevice();
+    auto rank = fl::getWorldRank();
+    FL_LOG(fl::ERROR) << "deviceId=" << deviceId << " rank=" << rank
+                      << ((deviceId != (rank % 8)) ? "XXXXX" : "oooo");
+    LOG_MEM_STATS();
     threadPool_ = std::make_unique<ThreadPool>(
         numThreads_,
         [deviceId](int /* threadId */) { af::setDevice(deviceId); });

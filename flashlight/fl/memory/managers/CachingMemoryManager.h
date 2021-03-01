@@ -49,6 +49,7 @@ class CachingMemoryManager : public MemoryManagerAdapter {
   void userUnlock(const void* ptr) override;
   bool isUserLocked(const void* ptr) override;
   void signalMemoryCleanup() override;
+  void signalMemoryCleanup(std::ostream* sink);
   float getMemoryPressure() override;
   bool jitTreeExceedsMemoryPressure(size_t bytes) override;
   void addMemoryManagement(int device) override;
@@ -57,7 +58,20 @@ class CachingMemoryManager : public MemoryManagerAdapter {
   // thread safe
   void setRecyclingSizeLimit(size_t);
   void setSplitSizeLimit(size_t);
-  enum RunPhase { kUnknown, kTrain, kEval, kBackward, kForward, kReduce,  kValidation};
+  enum RunPhase {
+    kUnknown, //0
+    kTrain,
+    kBackward,
+    kForward,
+    kReduce,
+    kEval, // 5
+    kPredictPL,
+    kTest, // 7
+    kValidation1, // 8
+    kValidation2,
+    kValidation3,
+    kValidation4
+  };
   void setRunPhase(RunPhase runPhase);
 
   // Block denotes a single allocated unit of memory.
@@ -157,8 +171,11 @@ class CachingMemoryManager : public MemoryManagerAdapter {
   // Using "-1" will return info for the current active device.
   DeviceMemoryInfo& getDeviceMemoryInfo(int device = -1);
 
-  void
-  freeBlocks(BlockSet& blocks, BlockSet::iterator it, BlockSet::iterator end);
+  void freeBlocks(
+      BlockSet& blocks,
+      BlockSet::iterator it,
+      BlockSet::iterator end,
+      std::ostream* sink);
 
   void mallocWithRetry(size_t size, void** ptr);
 

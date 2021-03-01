@@ -12,6 +12,7 @@
 #include "flashlight/app/asr/runtime/Helpers.h"
 #include "flashlight/ext/common/SequentialBuilder.h"
 #include "flashlight/fl/dataset/MemoryBlobDataset.h"
+#include "flashlight/fl/memory/managers/CachingMemoryManager.h"
 #include "flashlight/fl/meter/EditDistanceMeter.h"
 #include "flashlight/lib/text/decoder/LexiconDecoder.h"
 #include "flashlight/lib/text/decoder/LexiconFreeDecoder.h"
@@ -29,6 +30,21 @@ af::array removeNegative(const af::array& arr) {
 af::array removePad(const af::array& arr, int32_t padIdx) {
   return arr(arr != padIdx);
 }
+
+void logMemStats(const char* file, int line) {
+  if (fl::getWorldRank() == 0) {
+    std::stringstream ss;
+    ss << file << ":" << line << " logMemStats():" << std::endl;
+    auto* curMemMgr =
+        fl::MemoryManagerInstaller::currentlyInstalledMemoryManager();
+    if (curMemMgr) {
+      curMemMgr->logStats(&ss);
+    }
+    std::cerr << ss.str();
+  }
+}
+
+#define LOG_MEM_STATS() logMemStats(__FILE__, __LINE__)
 } // namespace
 
 // TODO threading?
@@ -189,35 +205,47 @@ std::shared_ptr<fl::Dataset> DecodeMaster::forward(
 std::shared_ptr<fl::Dataset> DecodeMaster::decode(
     const std::shared_ptr<fl::Dataset>& emissionDataset,
     fl::lib::text::Decoder& decoder) {
+  LOG_MEM_STATS();
   auto predDataset = std::make_shared<fl::MemoryBlobDataset>();
+  LOG_MEM_STATS();
   for (auto& sample : *emissionDataset) {
+    LOG_MEM_STATS();
     auto emission = sample[kDMTokenPredIdx];
     if (emission.numdims() > 2) {
       throw std::runtime_error("emission should be NxT");
     }
+    LOG_MEM_STATS();
     std::vector<float> emissionV(emission.elements());
     emission.as(af::dtype::f32).host(emissionV.data());
     auto results =
         decoder.decode(emissionV.data(), emission.dims(1), emission.dims(0));
 
+    LOG_MEM_STATS();
     std::vector<int> tokensV, wordsV;
     if (results.size() > 0) {
       tokensV = results[0].tokens;
       wordsV = results[0].words;
     }
+    LOG_MEM_STATS();
     tokensV.erase(
         std::remove(tokensV.begin(), tokensV.end(), -1), tokensV.end());
     wordsV.erase(std::remove(wordsV.begin(), wordsV.end(), -1), wordsV.end());
+    LOG_MEM_STATS();
     sample[kDMTokenPredIdx] =
         (tokensV.size() > 0
              ? af::array(af::dim4(tokensV.size()), tokensV.data())
              : af::array());
+    LOG_MEM_STATS();
     sample[kDMWordPredIdx] =
         (wordsV.size() > 0 ? af::array(af::dim4(wordsV.size()), wordsV.data())
                            : af::array());
+    LOG_MEM_STATS();
     predDataset->add(sample);
+    LOG_MEM_STATS();
   }
+  LOG_MEM_STATS();
   predDataset->writeIndex();
+  LOG_MEM_STATS();
   return predDataset;
 }
 

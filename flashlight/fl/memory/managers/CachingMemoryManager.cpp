@@ -95,6 +95,10 @@ std::string formatMemory(size_t bytes) {
   return bytesStr + " " + units[unitId];
 }
 
+void addMemSizeStat(std::ostream* sink, const std::string name, size_t size) {
+  *sink << name << ':' << size << ':' << formatMemory(size) << std::endl;
+}
+
 std::string formatPercentOf(size_t numerator, size_t denominator) {
   if (numerator == 0) {
     return "0";
@@ -177,7 +181,7 @@ void CachingMemoryManager::setRunPhase(RunPhase runPhase) {
 }
 
 void CachingMemoryManager::shutdown() {
-  signalMemoryCleanup();
+  signalMemoryCleanup(&std::cerr);
 }
 
 void CachingMemoryManager::addMemoryManagement(int device) {
@@ -263,11 +267,11 @@ void* CachingMemoryManager::alloc(
   block->managerLock_ = !userLock;
   block->userLock_ = userLock;
   block->useSize_ = useSize;
-  memoryInfo.stats_.useAllocatedBytes_ += useSize;
   const size_t nBits = log2int(useSize);
   ++memoryInfo.stats_.totalUseAllocatedBytesHist_[nBits];
   ++memoryInfo.stats_.curUseAllocatedBytesHist_[nBits];
 
+  memoryInfo.stats_.useAllocatedBytes_ += block->size_;
   memoryInfo.allocatedBlocks_[block->ptr_] = block;
   return static_cast<void*>(block->ptr_);
 }
@@ -312,6 +316,8 @@ void CachingMemoryManager::unlock(void* ptr, bool userUnlock) {
     return;
   }
   memoryInfo.allocatedBlocks_.erase(it);
+  memoryInfo.stats_.useAllocatedBytes_ -= block->size_;
+  --memoryInfo.stats_.curUseAllocatedBytesHist_[log2int(block->useSize_)];
   freeBlock(block);
 }
 
@@ -330,8 +336,6 @@ void CachingMemoryManager::freeBlock(CachingMemoryManager::Block* block) {
 
   pool.insert(block);
   memoryInfo.stats_.cachedBytes_ += block->size_;
-  memoryInfo.stats_.useAllocatedBytes_ -= block->useSize_;
-  --memoryInfo.stats_.curUseAllocatedBytesHist_[log2int(block->useSize_)];
 }
 
 /** combine previously split blocks */
@@ -369,10 +373,22 @@ void CachingMemoryManager::mallocWithRetry(size_t size, void** ptr) {
     *ptr = this->deviceInterface->nativeAlloc(size);
   } catch (std::exception& exUnused) {
     try {
-      signalMemoryCleanup();
+      std::stringstream ss;
+      ss << "second attempt memory of size " << size << " ("
+         << formatMemory(size) << ')' << std::endl;
+      ss << "Before signalMemoryCleanup() stats:" << std::endl;
+      logStats(&ss);
+      signalMemoryCleanup(&ss);
+      ss << "After signalMemoryCleanup() stats:" << std::endl;
+      logStats(&ss);
+      std::cerr << ss.str() << std::endl;
       ++memInfo.stats_.totalNativeMallocs_;
       *ptr = this->deviceInterface->nativeAlloc(size);
     } catch (std::exception& ex) {
+      size_t allocatedBytes = 0;
+      for (const auto& ptrAndSize : memInfo.stats_.nativeAllocated_) {
+        allocatedBytes += ptrAndSize.second;
+      }
       std::stringstream ss;
       // note: af exception inherits from std exception
       ss << "Failed to allocate memory of size " << size << "("
@@ -380,7 +396,7 @@ void CachingMemoryManager::mallocWithRetry(size_t size, void** ptr) {
          << ", Capacity: "
          << formatMemory(
                 this->deviceInterface->getMaxMemorySize(memInfo.deviceId_))
-         << ", Allocated: " << formatMemory(memInfo.stats_.allocatedBytes_)
+         << ", Allocated: " << formatMemory(allocatedBytes)
          << ", Cached: " << formatMemory(memInfo.stats_.cachedBytes_)
          << ") with error '" << ex.what() << "'" << std::endl;
       logStats(&ss);
@@ -391,31 +407,39 @@ void CachingMemoryManager::mallocWithRetry(size_t size, void** ptr) {
     }
   }
   memInfo.stats_.nativeAllocated_[*ptr] = size;
+  if (isMaster()) {
+    std::cerr << "nativeAlloc: ptr=" << ptr << " size=" << formatMemory(size)
+              << std::endl;
+  }
 }
 
 void CachingMemoryManager::freeBlocks(
     BlockSet& blocks,
     BlockSet::iterator it,
-    BlockSet::iterator end) {
+    BlockSet::iterator end,
+    std::ostream* sink) {
   // Frees all non-split blocks between `it` and `end`
   auto& memoryInfo = getDeviceMemoryInfo();
+  size_t totalFree = 0;
   while (it != end) {
     Block* block = *it;
     if (!block->isSplit()) {
+      addMemSizeStat(sink, "nativeFree", block->size_);
+      totalFree += block->size_;
       this->deviceInterface->nativeFree(static_cast<void*>(block->ptr_));
       ++memoryInfo.stats_.totalNativeFrees_;
       memoryInfo.stats_.nativeAllocated_.erase(block->ptr_);
 
-      memoryInfo.stats_.allocatedBytes_ -= block->size_;
-      memoryInfo.stats_.cachedBytes_ -= block->size_;
       auto cur = it;
       ++it;
       blocks.erase(cur);
+      memoryInfo.stats_.cachedBytes_ -= (*cur)->size_;
       delete block;
     } else {
       ++it;
     }
   }
+  addMemSizeStat(sink, "nativeFree_totalFree", totalFree);
 }
 
 void CachingMemoryManager::signalMemoryCleanup() {
@@ -423,23 +447,47 @@ void CachingMemoryManager::signalMemoryCleanup() {
   auto& memoryInfo = getDeviceMemoryInfo();
   std::lock_guard<std::recursive_mutex> lock(memoryInfo.mutexAll_);
 
-  if (isMaster()) {
-    printInfo("Before signalMemoryCleanup()", memoryInfo.deviceId_);
-  }
+  // if (isMaster()) {
+  //   printInfo("Before signalMemoryCleanup()", memoryInfo.deviceId_);
+  // }
+  std::cerr << "XXXXXXXXXXX wrong signalMemoryCleanup() called !!!!"
+            << std::endl;
 
   freeBlocks(
       memoryInfo.largeBlocks_,
       memoryInfo.largeBlocks_.begin(),
-      memoryInfo.largeBlocks_.end());
+      memoryInfo.largeBlocks_.end(),
+      &std::cerr);
 
   freeBlocks(
       memoryInfo.smallBlocks_,
       memoryInfo.smallBlocks_.begin(),
-      memoryInfo.smallBlocks_.end());
+      memoryInfo.smallBlocks_.end(),
+      &std::cerr);
 
-  if (isMaster()) {
-    printInfo("After signalMemoryCleanup()", memoryInfo.deviceId_);
-  }
+  // if (isMaster()) {
+  //   printInfo("After signalMemoryCleanup()", memoryInfo.deviceId_);
+  // }
+}
+
+void CachingMemoryManager::signalMemoryCleanup(std::ostream* sink) {
+  // Free all non-split cached blocks on device
+  auto& memoryInfo = getDeviceMemoryInfo();
+  std::lock_guard<std::recursive_mutex> lock(memoryInfo.mutexAll_);
+
+  *sink << "signalMemoryCleanup largeBlocks_" << std::endl;
+  freeBlocks(
+      memoryInfo.largeBlocks_,
+      memoryInfo.largeBlocks_.begin(),
+      memoryInfo.largeBlocks_.end(),
+      sink);
+
+  *sink << "signalMemoryCleanup smallBlocks_" << std::endl;
+  freeBlocks(
+      memoryInfo.smallBlocks_,
+      memoryInfo.smallBlocks_.begin(),
+      memoryInfo.smallBlocks_.end(),
+      sink);
 }
 
 float CachingMemoryManager::getMemoryPressure() {
@@ -453,12 +501,16 @@ bool CachingMemoryManager::jitTreeExceedsMemoryPressure(size_t /* unused */) {
 void CachingMemoryManager::printInfo(const char* msg, const int /* unused */) {
   auto& memInfo = getDeviceMemoryInfo();
   std::lock_guard<std::recursive_mutex> lock(memInfo.mutexAll_);
+  size_t allocatedBytes = 0;
+  for (const auto& ptrAndSize : memInfo.stats_.nativeAllocated_) {
+    allocatedBytes += ptrAndSize.second;
+  }
   std::cout << msg;
   std::cout << "\nType: CachingMemoryManager";
   std::cout << "\nDevice: " << memInfo.deviceId_ << ", Capacity: "
             << formatMemory(
                    this->deviceInterface->getMaxMemorySize(memInfo.deviceId_))
-            << ", Allocated: " << formatMemory(memInfo.stats_.allocatedBytes_)
+            << ", Allocated: " << formatMemory(allocatedBytes)
             << ", Cached: " << formatMemory(memInfo.stats_.cachedBytes_);
   std::cout << "\nTotal native calls: " << memInfo.stats_.totalNativeMallocs_
             << "(mallocs), " << memInfo.stats_.totalNativeFrees_ << "(frees)"
@@ -473,22 +525,38 @@ void subtractBlock(
     std::map<void*, size_t>& nativeMemMap,
     CachingMemoryManager::Block* block,
     size_t mask) {
-  void* blockPtr = (void*)(mask & (size_t)block->ptr_);
+  mask = 0x7FFFFFFFF0;
+
+  void* blockPtr = (void*)((mask & (size_t)block->ptr_) >> 4);
 
   auto itr = nativeMemMap.lower_bound(blockPtr);
   if (itr != nativeMemMap.end()) {
     --itr;
+    long long offset = (long long)blockPtr - (long long)itr->first;
+    if (offset < 0) {
+      std::stringstream ss;
+      ss << "subtractBlock error XXXXX offset=" << offset
+         << " block->ptr_=" << block->ptr_ << " blockPtr-mask=" << blockPtr
+         << " itr->first=" << itr->first << std::endl;
+      ss << "nativeMemMap=";
+      for (auto& ptrAndSize : nativeMemMap) {
+        ss << '[' << ptrAndSize.first << ',' << formatMemory(ptrAndSize.second)
+           << "] ";
+      }
+      std::cerr << ss.str() << std::endl;
+    }
+
     // If block happen to start right at the begining of a block at the memory
     // map.
-    if (blockPtr == itr->first) {
-      long leftOverSize = itr->second - block->size_;
+    if (offset == 0) {
+      long long leftOverSize = (long long)itr->second - (long long)block->size_;
       size_t newPtr = (size_t)blockPtr + block->size_;
       nativeMemMap[(void*)newPtr] = leftOverSize;
       nativeMemMap.erase(itr);
     } else {
-      size_t origSize = itr->second;
-      long leftOverSize =
-          (long)itr->first + itr->second - (long)blockPtr - block->size_;
+      long origSize = itr->second;
+      long origPtr = (long)itr->first;
+      long leftOverSize = origPtr + origSize - (long)blockPtr - block->size_;
       itr->second = (size_t)blockPtr - (size_t)itr->first;
       if (leftOverSize > 0) {
         size_t newPTr = (size_t)blockPtr + block->size_;
@@ -496,14 +564,11 @@ void subtractBlock(
       }
     }
   } else {
-    FL_LOG(fl::INFO) << "block_ [" << blockPtr << ','
+    FL_LOG(fl::INFO) << "block_ [" << blockPtr << '('
+                     << formatMemory((size_t)blockPtr) << ") ,"
                      << formatMemory(block->size_)
                      << "] not found in memory map";
   }
-}
-
-void addMemSizeStat(std::ostream* sink, const std::string name, size_t size) {
-  *sink << name << ':' << size << ':' << formatMemory(size) << std::endl;
 }
 
 } // namespace
@@ -514,7 +579,6 @@ void CachingMemoryManager::logStats(std::ostream* sink /*=&std::cout*/) {
 
   auto afDeviceId = af::getDevice();
 
-  size_t largestContiguousCache = 0;
   if (memInfo.stats_.gpuMemSize_ == 0) {
     const size_t capacity =
         this->deviceInterface->getMaxMemorySize(memInfo.deviceId_);
@@ -524,49 +588,60 @@ void CachingMemoryManager::logStats(std::ostream* sink /*=&std::cout*/) {
         ((1UL << (static_cast<size_t>(std::log2(capacity)) + 1)) - 1);
   }
 
-  std::map<void*, size_t> nativeMemMap;
-  bool refreshNativeMemMap = false;
+  size_t allocatedBytes = 0;
+  for (const auto& ptrAndSize : memInfo.stats_.nativeAllocated_) {
+    allocatedBytes += ptrAndSize.second;
+  }
+  size_t useAllocatedBytes = 0;
+  for (auto& ptrAndBlock : memInfo.allocatedBlocks_) {
+    if (ptrAndBlock.second->useSize_ > 0) {
+      useAllocatedBytes += ptrAndBlock.second->useSize_;
+    } else {
+      useAllocatedBytes += ptrAndBlock.second->size_;
+    }
+  }
+
   if (memInfo.stats_.totalNativeMallocs_ !=
       memInfo.stats_.totalNativeMallocsRecentLogging_) {
     memInfo.stats_.totalNativeMallocsRecentLogging_ =
         memInfo.stats_.totalNativeMallocs_;
-    memInfo.stats_.largestContiguousNative_ = 0;
-    refreshNativeMemMap = true;
 
+    std::map<void*, size_t> nativeMemMap;
     // Init native memory map with a single block the size of the entire native
     // memory.
     nativeMemMap[0] = memInfo.stats_.gpuMemSize_;
     nativeMemMap[(void*)(memInfo.stats_.gpuMemSize_ + 1)] = 0;
-  }
-  for (auto& ptAndBlock : memInfo.allocatedBlocks_) {
-    if (refreshNativeMemMap) {
+
+    for (auto& ptrAndBlock : memInfo.allocatedBlocks_) {
       subtractBlock(
-          nativeMemMap, ptAndBlock.second, memInfo.stats_.gpuMemMask_);
+          nativeMemMap, ptrAndBlock.second, memInfo.stats_.gpuMemMask_);
     }
-  }
-  for (auto block : memInfo.largeBlocks_) {
-    largestContiguousCache = std::max(largestContiguousCache, block->size_);
-    if (refreshNativeMemMap) {
+    for (auto block : memInfo.largeBlocks_) {
       subtractBlock(nativeMemMap, block, memInfo.stats_.gpuMemMask_);
     }
-  }
-  if (refreshNativeMemMap) {
     for (auto block : memInfo.smallBlocks_) {
       subtractBlock(nativeMemMap, block, memInfo.stats_.gpuMemMask_);
     }
+    memInfo.stats_.largestContiguousNative_ = 0;
     for (auto& cuBlock : nativeMemMap) {
       memInfo.stats_.largestContiguousNative_ =
           std::max(memInfo.stats_.largestContiguousNative_, cuBlock.second);
     }
   }
 
-  const size_t internalFragMem =
-      (memInfo.stats_.allocatedBytes_ - memInfo.stats_.cachedBytes_ -
-       memInfo.stats_.useAllocatedBytes_);
+  size_t largestContiguousCache = 0;
+  for (auto block : memInfo.largeBlocks_) {
+    largestContiguousCache = std::max(largestContiguousCache, block->size_);
+  }
 
+  const size_t internalFragMem =
+      (allocatedBytes - memInfo.stats_.cachedBytes_ - useAllocatedBytes);
+
+  *sink << "this:" << (void*)this << " memInfo:" << &memInfo
+        << " memInfo.stats_:" << &memInfo.stats_ << std::endl;
   addMemSizeStat(sink, "GpuMemSize", memInfo.stats_.gpuMemSize_);
-  addMemSizeStat(sink, "Allocated", memInfo.stats_.allocatedBytes_);
-  addMemSizeStat(sink, "Used", memInfo.stats_.useAllocatedBytes_);
+  addMemSizeStat(sink, "Allocated", allocatedBytes);
+  addMemSizeStat(sink, "Used", useAllocatedBytes);
   addMemSizeStat(sink, "Cached", memInfo.stats_.cachedBytes_);
   addMemSizeStat(sink, "LargestContiguousCache", largestContiguousCache);
   addMemSizeStat(
@@ -590,15 +665,17 @@ void CachingMemoryManager::logStats(std::ostream* sink /*=&std::cout*/) {
 
   *sink << "InternalFragmentation:"
         << formatPercentOf(
-               memInfo.stats_.useAllocatedBytes_,
-               memInfo.stats_.allocatedBytes_ - memInfo.stats_.cachedBytes_)
+               useAllocatedBytes, allocatedBytes - memInfo.stats_.cachedBytes_)
         << std::endl
         << "NativeMallocCount:" << memInfo.stats_.totalNativeMallocs_
         << std::endl
         << "RunPhase:" << memInfo.stats_.runPhase_ << std::endl
         << "NativeFreeCout:" << memInfo.stats_.totalNativeFrees_ << std::endl
         << "Device:" << memInfo.deviceId_ << std::endl
-        << "Rank: " << fl::getWorldRank() << std::endl;
+        << "Rank: " << fl::getWorldRank() << ':' << (fl::getWorldRank() % 8)
+        << ':' << memInfo.deviceId_ << ':'
+        << (((fl::getWorldRank() % 8) == memInfo.deviceId_) ? "ok" : "err")
+        << std::endl;
 
   {
     *sink << "TotalUseAllocatedBytesHist:";
@@ -634,8 +711,11 @@ void CachingMemoryManager::userLock(const void* ptr) {
   if (it == memoryInfo.allocatedBlocks_.end()) {
     // Follows the behavior of DefaultMemoryManager
     auto block = new Block(kSmallBuffer, const_cast<void*>(ptr));
+    std::cerr << "CachingMemoryManager::userLock() XXXXX gussing size="
+              << kSmallBuffer << std::endl;
     block->managerLock_ = false;
     block->userLock_ = true;
+    memoryInfo.stats_.useAllocatedBytes_ += block->size_;
     memoryInfo.allocatedBlocks_[block->ptr_] = block;
   } else {
     it->second->userLock_ = true;

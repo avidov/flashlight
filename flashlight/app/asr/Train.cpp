@@ -92,6 +92,7 @@ DEFINE_double(slimIPL_dyn_dropout, -1, "dyn dropout to set at slimIPL_start");
 } // namespace
 
 void markPhase(fl::CachingMemoryManager::RunPhase phase) {
+  std::cerr << "markPhase(" << phase << ")";
   auto* curMemMgr =
       fl::MemoryManagerInstaller::currentlyInstalledMemoryManager();
   if (curMemMgr) {
@@ -99,6 +100,41 @@ void markPhase(fl::CachingMemoryManager::RunPhase phase) {
     cacheMgr->setRunPhase(phase);
   }
 }
+
+void logMemStats(const char* file, int line) {
+  if (fl::getWorldRank() == 0) {
+    std::stringstream ss;
+    ss << file << ":" << line << " logMemStats():" << std::endl;
+    auto* curMemMgr =
+        fl::MemoryManagerInstaller::currentlyInstalledMemoryManager();
+    if (curMemMgr) {
+      curMemMgr->logStats(&ss);
+    }
+    std::cerr << ss.str();
+  }
+}
+
+#define LOG_MEM_STATS() logMemStats(__FILE__, __LINE__)
+
+void signalMemoryCleanup(const char* file, int line) {
+  if (fl::getWorldRank() == 0) {
+    std::stringstream ss;
+    ss << file << ":" << line << " signalMemoryCleanup():" << std::endl;
+    auto* curMemMgr =
+        fl::MemoryManagerInstaller::currentlyInstalledMemoryManager();
+    if (curMemMgr) {
+      ss << "Before signalMemoryCleanup() stats:" << std::endl;
+      curMemMgr->logStats(&ss);
+      auto* cacheMgr = dynamic_cast<fl::CachingMemoryManager*>(curMemMgr);
+      cacheMgr->signalMemoryCleanup(&ss);
+      ss << "After signalMemoryCleanup() stats:" << std::endl;
+      curMemMgr->logStats(&ss);
+    }
+    std::cerr << ss.str();
+  }
+}
+
+#define SIG_MEM_CLEAN() signalMemoryCleanup(__FILE__, __LINE__)
 
 int main(int argc, char** argv) {
   fl::init();
@@ -808,22 +844,28 @@ int main(int argc, char** argv) {
                   std::shared_ptr<fl::Dataset> validds,
                   DatasetMeters& mtrs,
                   double& dmErr) {
+    markPhase(fl::CachingMemoryManager::RunPhase::kTest);
     ntwrk->eval();
     crit->eval();
     mtrs.tknEdit.reset();
     mtrs.wrdEdit.reset();
     mtrs.loss.reset();
+    // LOG_MEM_STATS();
 
     auto curValidset = loadPrefetchDataset(
         validds, FLAGS_nthread, false /* shuffle */, 0 /* seed */);
+    // LOG_MEM_STATS();
+    // SIG_MEM_CLEAN();
 
     if (dm) {
+      LOG_MEM_STATS();
       fl::TimeMeter timer;
       timer.resume();
       FL_LOG_MASTER(INFO) << "[Beam-search decoder]   * DM: compute emissions";
       auto eds = dm->forward(curValidset);
       FL_LOG_MASTER(INFO) << "[Beam-search decoder]   * DM: decode";
       std::vector<double> lmweights;
+      // LOG_MEM_STATS();
       for (double lmweight = FLAGS_lmweight_low;
            lmweight <= FLAGS_lmweight_high;
            lmweight += FLAGS_lmweight_step) {
@@ -832,6 +874,9 @@ int main(int argc, char** argv) {
       }
       std::vector<std::vector<int64_t>> wordEditDst(lmweights.size());
       std::vector<std::thread> threads;
+      SIG_MEM_CLEAN();
+
+      FL_LOG_MASTER(WARNING) << "lmweights.size()=" << lmweights.size();
       for (int i = 0; i < lmweights.size(); i++) {
         threads.push_back(
             std::thread([&lmweights, &wordEditDst, dm, eds, &lexicon, i]() {
@@ -852,14 +897,18 @@ int main(int argc, char** argv) {
                       (FLAGS_smearing == "max"
                            ? fl::lib::text::SmearingMode::MAX
                            : fl::lib::text::SmearingMode::NONE)};
+              // LOG_MEM_STATS();
               auto pds = dm->decode(eds, lexicon, opt);
+              // LOG_MEM_STATS();
               // return token distance and word distance stats
               wordEditDst[i] = dm->computeMetrics(pds).second;
+              // LOG_MEM_STATS();
             }));
       }
       for (auto& thread : threads) {
         thread.join();
       }
+      // LOG_MEM_STATS();
       dmErr = DBL_MAX;
       for (int i = 0; i < lmweights.size(); i++) {
         af::array currentEditDist =
@@ -877,6 +926,7 @@ int main(int argc, char** argv) {
             << " WER: " << wer;
         dmErr = std::min(dmErr, wer);
       }
+      // LOG_MEM_STATS();
       FL_LOG_MASTER(INFO) << "[Beam-search decoder]   * DM: done with best WER "
                           << dmErr;
       timer.stop();
@@ -884,21 +934,27 @@ int main(int argc, char** argv) {
           << "[Beam-search decoder] time spent on grid-search for decoding: "
           << timer.value() << "s";
     }
+    // LOG_MEM_STATS();
 
     for (auto& batch : *curValidset) {
       fl::Variable output = ntwrk
                                 ->forward({fl::input(batch[kInputIdx]),
                                            fl::noGrad(batch[kDurationIdx])})
                                 .front();
+      // LOG_MEM_STATS();
       std::vector<fl::Variable> critArgs = {
           output, fl::Variable(batch[kTargetIdx], false)};
       if (isSeq2seqCrit) {
+        // LOG_MEM_STATS();
         critArgs.push_back(fl::Variable(batch[kDurationIdx], false));
         critArgs.push_back(fl::Variable(batch[kTargetSizeIdx], false));
       }
+      LOG_MEM_STATS();
       auto loss = crit->forward(critArgs).front();
       mtrs.loss.add(loss.array());
+      LOG_MEM_STATS();
       evalOutput(output.array(), batch[kTargetIdx], batch[kDurationIdx], mtrs);
+      LOG_MEM_STATS();
     }
   };
 
@@ -987,7 +1043,8 @@ int main(int argc, char** argv) {
                                   int64_t totalUpdates,
                                   double lr,
                                   double lrcrit) {
-      markPhase(fl::CachingMemoryManager::RunPhase::kValidation);
+      markPhase(fl::CachingMemoryManager::RunPhase::kValidation1);
+      // LOG_MEM_STATS();
 
       meters.runtime.stop();
       meters.timer.stop();
@@ -996,15 +1053,19 @@ int main(int argc, char** argv) {
       meters.critfwdtimer.stop();
       meters.bwdtimer.stop();
       meters.optimtimer.stop();
+      // LOG_MEM_STATS();
 
       // valid
       for (auto& vds : validds) {
         double decodedWer;
+        LOG_MEM_STATS();
         test(ntwrk, crit, vds.second, meters.valid[vds.first], decodedWer);
+        // LOG_MEM_STATS();
         if (validWerWithDecoder.find(vds.first) != validWerWithDecoder.end()) {
           validWerWithDecoder[vds.first] = decodedWer;
         }
       }
+      markPhase(fl::CachingMemoryManager::RunPhase::kValidation2);
 
       // print status
       try {
@@ -1013,12 +1074,18 @@ int main(int argc, char** argv) {
       } catch (const std::exception& ex) {
         LOG(ERROR) << "Error while writing logs: " << ex.what();
       }
+      // LOG_MEM_STATS();
+
       // save last and best models
+      markPhase(fl::CachingMemoryManager::RunPhase::kValidation3);
       try {
         saveModels(totalEpochs, totalUpdates);
       } catch (const std::exception& ex) {
         LOG(FATAL) << "Error while saving models: " << ex.what();
       }
+      markPhase(fl::CachingMemoryManager::RunPhase::kValidation4);
+      // LOG_MEM_STATS();
+
       // reset meters for next readings
       meters.train.loss.reset();
       meters.train.tknEdit.reset();
@@ -1026,6 +1093,7 @@ int main(int argc, char** argv) {
       meters.trainUnsup.loss.reset();
       meters.trainUnsup.tknEdit.reset();
       meters.trainUnsup.wrdEdit.reset();
+      // LOG_MEM_STATS();
     };
 
     int64_t curBatch = startUpdate;
@@ -1044,6 +1112,8 @@ int main(int argc, char** argv) {
       std::iota(unsupBatchesIndices.begin(), unsupBatchesIndices.end(), 0);
     }
     while (curBatch < nbatches) {
+      markPhase(fl::CachingMemoryManager::RunPhase::kTrain);
+
       ++curEpoch; // counts partial epochs too!
       int64_t epochsAfterDecay = curEpoch - FLAGS_lr_decay;
       double lrDecayScale = std::pow(
@@ -1231,6 +1301,7 @@ int main(int argc, char** argv) {
 
         auto predictPL =
             [&](std::vector<af::array> inpBatch) -> std::vector<std::string> {
+          markPhase(fl::CachingMemoryManager::RunPhase::kPredictPL);
           ntwrk->eval();
           crit->eval();
           auto outputUnsupOriginal =
@@ -1290,6 +1361,7 @@ int main(int argc, char** argv) {
           fl::Variable input, output;
           af::array newUnsupDuration;
           // forward
+          markPhase(fl::CachingMemoryManager::RunPhase::kForward);
           meters.fwdtimer.resume();
           if (!batch.empty()) {
             input = fl::input(batch[kInputIdx]);
@@ -1420,6 +1492,7 @@ int main(int argc, char** argv) {
           af::sync();
           meters.fwdtimer.stopAndIncUnit();
           meters.critfwdtimer.stopAndIncUnit();
+          markPhase(fl::CachingMemoryManager::RunPhase::kTrain);
 
           if (FLAGS_fl_amp_use_mixed_precision) {
             ++scaleCounter;
@@ -1449,6 +1522,7 @@ int main(int argc, char** argv) {
           }
 
           markPhase(fl::CachingMemoryManager::RunPhase::kBackward);
+          // LOG_MEM_STATS();
 
           // backward
           meters.bwdtimer.resume();
@@ -1508,6 +1582,7 @@ int main(int argc, char** argv) {
             meters.optimtimer.stop();
             continue;
           }
+          // LOG_MEM_STATS();
 
           if (isSupBatch) {
             meters.train.loss.add((loss / scaleFactor).array());
@@ -1536,12 +1611,14 @@ int main(int argc, char** argv) {
             }
             fl::clipGradNorm(params, FLAGS_maxgradnorm);
           }
+          // LOG_MEM_STATS();
 
           // update weights
           critopt->step();
           netopt->step();
           af::sync();
           meters.optimtimer.stopAndIncUnit();
+          // LOG_MEM_STATS();
 
           // update scale factor
           if (FLAGS_fl_amp_use_mixed_precision &&
@@ -1571,12 +1648,18 @@ int main(int argc, char** argv) {
         }
         meters.sampletimer.resume();
 
+        // LOG_MEM_STATS();
+
         if (FLAGS_reportiters > 0 && curBatch % FLAGS_reportiters == 0) {
+          LOG_MEM_STATS();
           runValAndSaveModel(
               curEpoch, curBatch, netopt->getLr(), critopt->getLr());
+          // LOG_MEM_STATS();
           resetTimeStatMeters();
           ntwrk->train();
           crit->train();
+          // LOG_MEM_STATS();
+
           meters.sampletimer.resume();
           meters.runtime.resume();
           meters.timer.resume();
@@ -1585,16 +1668,22 @@ int main(int argc, char** argv) {
           break;
         }
       }
+      // LOG_MEM_STATS();
+
       af::sync();
       if (FLAGS_reportiters == 0) {
+        LOG_MEM_STATS();
+
         runValAndSaveModel(
             curEpoch, curBatch, netopt->getLr(), critopt->getLr());
+        LOG_MEM_STATS();
       }
     }
   };
 
   /* ===================== Train ===================== */
   if (FLAGS_linseg - startUpdate > 0) {
+    LOG_MEM_STATS();
     train(
         network,
         linseg,
@@ -1606,6 +1695,7 @@ int main(int argc, char** argv) {
         initLinCritlr,
         false /* clampCrit */,
         FLAGS_linseg - startUpdate);
+    LOG_MEM_STATS();
 
     startUpdate = FLAGS_linseg;
     FL_LOG_MASTER(INFO) << "Finished LinSeg";
@@ -1617,6 +1707,7 @@ int main(int argc, char** argv) {
     if (!s2s && !trde) {
       LOG(FATAL) << "Window pretraining only allowed for seq2seq.";
     }
+    LOG_MEM_STATS();
     train(
         network,
         criterion,
@@ -1630,6 +1721,7 @@ int main(int argc, char** argv) {
         FLAGS_pretrainWindow);
     startUpdate = FLAGS_pretrainWindow;
     FL_LOG_MASTER(INFO) << "Finished window pretraining.";
+    LOG_MEM_STATS();
   }
   if (s2s) {
     s2s->clearWindow();
@@ -1638,6 +1730,8 @@ int main(int argc, char** argv) {
   }
 
   if (FLAGS_slimIPL_start - startUpdate > 0) {
+    LOG_MEM_STATS();
+
     train(
         network,
         criterion,
@@ -1651,7 +1745,9 @@ int main(int argc, char** argv) {
         FLAGS_slimIPL_start);
     startUpdate = FLAGS_slimIPL_start;
     FL_LOG_MASTER(INFO) << "Finished supervised only pretraining.";
+    LOG_MEM_STATS();
   }
+  LOG_MEM_STATS();
 
   train(
       network,
@@ -1664,6 +1760,7 @@ int main(int argc, char** argv) {
       FLAGS_lrcrit,
       true /* clampCrit */,
       FLAGS_iter);
+  LOG_MEM_STATS();
 
   FL_LOG_MASTER(INFO) << "Finished training";
   return 0;
