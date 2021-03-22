@@ -86,7 +86,7 @@ int main(int argc, char** argv) {
 
   float learning_rate = 1e-2;
   int epochs = 10;
-  int batch_size = 2;
+  int batch_size = 1;
 
   array train_x;
   array train_y;

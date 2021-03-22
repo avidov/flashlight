@@ -7,6 +7,7 @@
 
 #include <exception>
 #include <iomanip>
+#include <iostream>
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
@@ -48,6 +49,8 @@ DEFINE_string(
 DEFINE_uint64(data_batch_size, 256, "Total batch size across all gpus");
 DEFINE_string(exp_checkpoint_path, "/tmp/model", "Checkpointing prefix path");
 DEFINE_int64(exp_checkpoint_epoch, -1, "Checkpoint epoch to load from");
+DEFINE_int64(device, 0, "Device number");
+DEFINE_int64(report_iters, 10, "number of iterations between reports");
 
 using namespace fl;
 using fl::ext::image::compose;
@@ -94,7 +97,7 @@ int main(int argc, char** argv) {
   google::InstallFailureSignalHandler();
   gflags::ParseCommandLineFlags(&argc, &argv, true);
 
-  const std::string labelPath = lib::pathsConcat(FLAGS_data_dir, "words.txt");
+  const std::string labelPath = lib::pathsConcat(FLAGS_data_dir, "labels.txt");
   const std::string trainList = lib::pathsConcat(FLAGS_data_dir, "train");
   const std::string valList = lib::pathsConcat(FLAGS_data_dir, "val");
 
@@ -110,10 +113,11 @@ int main(int argc, char** argv) {
   //       FLAGS_distributed_rndv_filepath);
   // }
   const int worldRank = 0; // fl::getWorldRank();
-  const int worldSize = 0 ;// fl::getWorldSize();
+  const int worldSize = 1 ;// fl::getWorldSize();
   const bool isMaster = (worldRank == 0);
 
-  af::setDevice(worldRank);
+  af::setDevice(FLAGS_device);
+  // af::setDevice(worldRank);
   af::setSeed(worldSize);
 
   // auto reducer =
@@ -149,6 +153,7 @@ int main(int argc, char** argv) {
   const int64_t batchSizePerGpu = FLAGS_data_batch_size;
   const int64_t prefetchThreads = 10;
   const int64_t prefetchSize = FLAGS_data_batch_size;
+  LOG(INFO) << "labelPath=" << labelPath << std::endl;
   auto labelMap = getImagenetLabels(labelPath);
   auto trainDataset = fl::ext::image::DistributedDataset(
       imagenetDataset(trainList, labelMap, {trainTransforms}),
@@ -165,6 +170,9 @@ int main(int argc, char** argv) {
       batchSizePerGpu,
       prefetchThreads,
       prefetchSize);
+
+  // auto trainDataset =  imagenetDataset(trainList, labelMap, {trainTransforms});
+  // auto valDataset = imagenetDataset(valList, labelMap, {valTransforms});
 
   //////////////////////////
   //  Load model and optimizer
@@ -249,7 +257,7 @@ int main(int argc, char** argv) {
 
       // Compute and record the prediction error.
       double trainLoss = trainLossMeter.value()[0];
-      if (++idx % 50 == 0) {
+      if (++idx % FLAGS_report_iters == 0) {
         // fl::ext::syncMeter(trainLossMeter);
         // fl::ext::syncMeter(timeMeter);
         // fl::ext::syncMeter(top5Acc);
