@@ -59,7 +59,6 @@ Variable batchnorm(
 
   fl::Variable result;
   if (train) {
-    auto inputCopyNoGrad = Variable(input.array(), false);
     auto sampleMean = fl::mean(input, axisComplement);
     auto sampleVar = fl::var(
         input,
@@ -71,8 +70,8 @@ Variable batchnorm(
 
     runningMeanDims = (1 - momentum) * runningMeanDims + momentum * sampleMean;
     runningVarDims = (1 - momentum) * runningVarDims + momentum * sampleVar;
-    runningMean = fl::moddims(runningMeanDims, runningMean.dims());
-    runningVar = fl::moddims(runningVarDims, runningVar.dims());
+    // runningMean = fl::moddims(runningMeanDims, runningMean.dims());
+    // runningVar = fl::moddims(runningVarDims, runningVar.dims());
   } else {
     result = (input - fl::tileAs(runningMeanDims, input)) /
         fl::tileAs(fl::sqrt(runningVarDims + epsilon), input);

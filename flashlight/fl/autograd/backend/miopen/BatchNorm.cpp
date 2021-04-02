@@ -18,6 +18,8 @@
 #include "flashlight/fl/common/Logging.h"
 #include "flashlight/fl/common/MiOpenUtils.h"
 
+using fl::miopen::MiOpenDevicePtr;
+
 namespace fl {
 
 Variable batchnorm(
@@ -163,9 +165,8 @@ Variable batchnorm(
         // FL_LOG(fl::INFO) << "gradFunc";
 
         auto& in = inputs[0];
-        auto inArray = detail::adjustInputType(in.array(), "batchnorm");
-        auto gradOutputArray =
-            detail::adjustInputType(gradOutput.array(), "batchnorm");
+        auto inArray =in.array();
+        auto gradOutputArray = gradOutput.array();
         // Weight, bias, and running mean/var arrays can't be fp16 (must be
         // fp32)
         auto wt = inputs[1].isempty()

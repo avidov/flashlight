@@ -45,6 +45,7 @@ Variable pool2d(
   size_t workSpaceSize = 0;
   MIOPEN_CHECK_ERR(miopenPoolingGetWorkSpaceSizeV2(
       pool_desc.descriptor, out_desc.descriptor, &workSpaceSize));
+  workSpaceSize = std::max(workSpaceSize, sizeof(float));
   auto wspace = af::array(workSpaceSize, af::dtype::b8);
   {
     MiOpenDevicePtr inputraw(input.array());

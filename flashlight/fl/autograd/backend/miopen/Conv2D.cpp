@@ -408,8 +408,9 @@ Variable conv2d(
             oDesc.descriptor,
             inArray.type());
 
+        auto worksspaceSize = std::max(bwdFilterAlgoBestPerf.workspace_size, sizeof(float)); 
         af::array ws =
-            af::array(bwdFilterAlgoBestPerf.workspace_size, af::dtype::b8);
+            af::array(worksspaceSize);
 
         auto gradWeight =
             Variable(af::array(wtArray.dims(), wtArray.type()), false);

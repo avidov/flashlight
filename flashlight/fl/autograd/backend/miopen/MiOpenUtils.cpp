@@ -297,7 +297,6 @@ ConvDescriptor::ConvDescriptor(
 
   if (groups > 1) {
     MIOPEN_CHECK_ERR(miopenSetConvolutionGroupCount(descriptor, groups));
-    FL_LOG(fl::INFO) << "miopenSetConvolutionGroupCount groups=" << groups; 
  }
 }
 

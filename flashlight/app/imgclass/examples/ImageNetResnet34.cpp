@@ -152,6 +152,7 @@ int main(int argc, char** argv) {
 
   const int64_t batchSizePerGpu = FLAGS_data_batch_size;
   const int64_t prefetchThreads = 10;
+  // const int64_t prefetchThreads = 1;
   const int64_t prefetchSize = FLAGS_data_batch_size;
   LOG(INFO) << "labelPath=" << labelPath << std::endl;
   auto labelMap = getImagenetLabels(labelPath);
@@ -170,9 +171,6 @@ int main(int argc, char** argv) {
       batchSizePerGpu,
       prefetchThreads,
       prefetchSize);
-
-  // auto trainDataset =  imagenetDataset(trainList, labelMap, {trainTransforms});
-  // auto valDataset = imagenetDataset(valList, labelMap, {valTransforms});
 
   //////////////////////////
   //  Load model and optimizer
@@ -230,6 +228,7 @@ int main(int argc, char** argv) {
     timeMeter.resume();
     int idx = 0;
     for (auto& example : trainDataset) {
+      std::cout << "batch example.size()=" << example.size() << std::endl;
       opt.zeroGrad();
       // Make a Variable from the input array.
       auto inputs = noGrad(example[kImagenetInputIdx]);
